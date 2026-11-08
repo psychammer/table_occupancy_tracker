@@ -12,29 +12,30 @@ from utilities.duplicates import remove_duplicates
 from utilities.standing_filter import remove_standing
 from utilities.tables import people_at_table, draw_tabletops, get_taken_seats
 from utilities.table_state import TableState, TableConfig, State
+from utilities.stabilizer import CameraStabilizer  # <--- Added import
 
 DEFAULT_SETTINGS = {
     "video_path": "videos/PlaceE_reduced.mp4",
     "yolo_model": "yolo26l.pt",
     "pose_model": "yolo26s-pose.pt",
     "confidence": 0.30,
-    "infer_fps": 4.0,              # inference runs this many times per second, not per frame
+    "infer_fps": 4.0,
     "occupy_seconds": 3.0,
     "free_seconds": 20.0,
     "up_lock_seconds": 2.0,
     "down_lock_seconds": 10.0,
-    "check_after_seconds": 300.0,  # "check on table" alert
+    "check_after_seconds": 300.0,
     "min_visit_seconds": 20.0,
     "require_clearing": True,
     "seats_per_table": 4,
-    "display_size": (1280, 720)
+    "display_size": (1280, 720),
+    "stabilize_camera": True,                     # <--- Added setting
 }
 
 GREEN = (0, 200, 0)
 RED = (0, 0, 255)
 AMBER = (0, 165, 255)
 
-# ---------- models are loaded once and reused across restarts ----------
 _models = {}
 
 def get_models(cfg):
@@ -45,18 +46,15 @@ def get_models(cfg):
     return _models[key]
 
 
-# ---------- video source: files are paced + looped, streams are drained + reconnected ----------
 def parse_source(path):
-    """'0', '1', ... mean a local webcam; anything else is a file path or a stream URL."""
     text = str(path).strip()
     return int(text) if text.isdigit() else text
 
 
 def open_capture(src):
     if isinstance(src, int):
-        # DirectShow opens faster and more reliably on Windows
         cap = cv2.VideoCapture(src, cv2.CAP_DSHOW) if sys.platform == "win32" else cv2.VideoCapture(src)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)   # keep the 16:9 shape the table polygons assume
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         return cap
     return cv2.VideoCapture(src)
@@ -74,6 +72,7 @@ class VideoSource:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
+        self.did_loop = False                      # <--- Added loop tracker
 
     def read(self):
         return self._read_file() if self.is_file else self._read_stream()
@@ -84,12 +83,12 @@ class VideoSource:
             fps = self._cap.get(cv2.CAP_PROP_FPS)
             self._fps = fps if fps and fps > 0 and not np.isnan(fps) else 30.0
         ok, frame = self._cap.read()
-        if not ok:  # end of file: loop for demo purposes
+        if not ok:
             self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            self.did_loop = True                  # Signal video loop
             ok, frame = self._cap.read()
             if not ok:
                 return None
-        # play at real speed so wall-clock timers match the footage
         now = time.monotonic()
         if self._next_t > now:
             time.sleep(self._next_t - now)
@@ -107,7 +106,6 @@ class VideoSource:
         return frame
 
     def _reader(self):
-        """Reads continuously so OpenCV's buffer never goes stale; reconnects with backoff."""
         backoff = 1.0
         while not self._stop.is_set():
             cap = open_capture(self.src)
@@ -120,7 +118,7 @@ class VideoSource:
             while not self._stop.is_set():
                 ok, frame = cap.read()
                 if not ok:
-                    break  # dropped connection -> outer loop reconnects
+                    break
                 with self._lock:
                     self._latest = frame
             cap.release()
@@ -132,7 +130,6 @@ class VideoSource:
 
 
 def ensure_default_table_files():
-    """Creates sample 6-table layout if tables.json / tabletops.json don't exist yet."""
     if not os.path.exists("tables.json"):
         sample_tables = {
             "Table 1": [[100, 180], [360, 180], [360, 390], [100, 390]],
@@ -169,15 +166,6 @@ def _empty_info(tables, seats):
 
 def run_pipeline(settings=None, on_visit_end=None, on_event=None,
                  should_stop=None, commands=None):
-    """
-    Generator yielding (annotated_frame, info_dict).
-
-    on_visit_end(visit_dict)  - completed visit, with start_ts / end_ts
-    on_event(event_dict)      - SEATED / CHECK_ON_TABLE / GUESTS_LEFT / NEEDS_CLEARING / CLEARED
-    should_stop()             - return True to end the generator
-    commands                  - queue.Queue of ("cleared", table_name) from the dashboard
-    All timers use time.monotonic(), so they are correct at any video/inference FPS.
-    """
     cfg = {**DEFAULT_SETTINGS, **(settings or {})}
     ensure_default_table_files()
 
@@ -188,6 +176,7 @@ def run_pipeline(settings=None, on_visit_end=None, on_event=None,
 
     det_model, pose_model = get_models(cfg)
     source = VideoSource(cfg["video_path"])
+    stabilizer = CameraStabilizer()               # <--- Initialize stabilizer
 
     tcfg = TableConfig(
         occupy_seconds=cfg["occupy_seconds"], free_seconds=cfg["free_seconds"],
@@ -211,6 +200,7 @@ def run_pipeline(settings=None, on_visit_end=None, on_event=None,
     infer_interval = 1.0 / max(0.5, cfg["infer_fps"])
     last_infer = -1e9
     clean_boxes = []
+    last_raw_boxes = []
     taken = {t: [] for t in tables}
     info = _empty_info(tables, seats)
     frame_idx = 0
@@ -218,7 +208,6 @@ def run_pipeline(settings=None, on_visit_end=None, on_event=None,
 
     try:
         while not (should_stop and should_stop()):
-            # staff actions from the dashboard
             while commands is not None and not commands.empty():
                 cmd, name = commands.get_nowait()
                 if cmd == "cleared" and name in states:
@@ -226,8 +215,6 @@ def run_pipeline(settings=None, on_visit_end=None, on_event=None,
 
             frame = source.read()
             if frame is None:
-                # No *new* frame yet is normal for live sources (we poll faster than the camera
-                # delivers). Only treat it as an outage after a few seconds without any frame.
                 if time.monotonic() - last_frame_t < 3.0:
                     time.sleep(0.005)
                     continue
@@ -238,12 +225,32 @@ def run_pipeline(settings=None, on_visit_end=None, on_event=None,
                 yield frame, info
                 continue
 
+            # Reset reference if video looped
+            if getattr(source, "did_loop", False):
+                stabilizer.reset()
+                source.did_loop = False
+
             last_frame_t = time.monotonic()
             frame = cv2.resize(frame, cfg["display_size"])
             frame_idx += 1
             now = time.monotonic()
 
-            # ---- inference + state update, throttled to infer_fps ----
+            # ---- Update camera motion stabilizer ----
+            stabilize_on = cfg.get("stabilize_camera", True)
+            if stabilize_on:
+                stabilizer.update_homography(frame, exclude_boxes=last_raw_boxes)
+
+            # Warp table polygons to match current camera viewpoint
+            live_tables = {
+                t_name: stabilizer.transform_points(pts, enable=stabilize_on)
+                for t_name, pts in tables.items()
+            }
+            live_tabletops = {
+                t_name: stabilizer.transform_points(pts, enable=stabilize_on)
+                for t_name, pts in tabletops.items()
+            }
+
+            # ---- inference + state update ----
             if now - last_infer >= infer_interval:
                 last_infer = now
                 det = det_model(frame, classes=[0], conf=cfg["confidence"], verbose=False)[0]
@@ -255,16 +262,18 @@ def run_pipeline(settings=None, on_visit_end=None, on_event=None,
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
                         raw_boxes.append((x1, y1, x2, y2, float(box.conf[0])))
 
+                last_raw_boxes = [b[:4] for b in raw_boxes]
                 seated = remove_standing(raw_boxes, pose)
                 clean_boxes = remove_duplicates(seated, max_overlap=0.70)
                 centers = [((b[0] + b[2]) // 2, (b[1] + b[3]) // 2) for b in clean_boxes]
 
-                for t_name, t_poly in tables.items():
+                # Use live_tables for testing occupancy
+                for t_name, t_poly in live_tables.items():
                     inside = people_at_table(centers, t_poly)
                     dispatch(states[t_name].update(len(inside), now))
                     taken[t_name] = get_taken_seats(inside, t_poly, seats)
 
-            # ---- draw (every frame, using cached detections) ----
+            # ---- draw detections ----
             for x1, y1, x2, y2, conf in clean_boxes:
                 cv2.rectangle(frame, (x1, y1), (x2, y2), GREEN, 2)
                 cv2.putText(frame, f"Person {conf:.2f}", (x1, y1 - 8),
@@ -273,9 +282,11 @@ def run_pipeline(settings=None, on_visit_end=None, on_event=None,
             table_colors, table_stats = {}, {}
             occupied_n = dirty_n = total_guests = 0
             durations = []
-            for t_name, t_poly in tables.items():
+            
+            # Use live_tables for text positioning
+            for t_name, t_poly in live_tables.items():
                 snap = states[t_name].snapshot(now)
-                tx, ty = t_poly[0]
+                tx, ty = t_poly[0] if len(t_poly) > 0 else (50, 50)
                 if snap["state"] == State.OCCUPIED.value:
                     occupied_n += 1
                     total_guests += snap["guests"]
@@ -298,7 +309,8 @@ def run_pipeline(settings=None, on_visit_end=None, on_event=None,
                 snap["total_seats"] = seats
                 table_stats[t_name] = snap
 
-            frame = draw_tabletops(frame, tabletops, table_colors, tint=0.40)
+            # Draw tabletops with live warped coordinates
+            frame = draw_tabletops(frame, live_tabletops, table_colors, tint=0.40)
 
             total_seats = len(tables) * seats
             utilization = min(1.0, total_guests / max(1, total_seats)) * 100.0
@@ -323,7 +335,6 @@ def run_pipeline(settings=None, on_visit_end=None, on_event=None,
             }
             yield frame, info
     finally:
-        # restart/shutdown: log any visit still in progress instead of dropping it
         now = time.monotonic()
         for st in states.values():
             dispatch(st.force_end(now))

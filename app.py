@@ -252,6 +252,7 @@ class SettingsUpdate(BaseModel):
     confidence: float = Field(gt=0, lt=1)
     check_after_seconds: float = Field(default=300, ge=10, le=7200)
     infer_fps: float = Field(default=4, ge=0.5, le=30)
+    stabilize_camera: bool = Field(default=True)
 
 @app.get("/api/settings")
 def get_settings():
@@ -381,6 +382,7 @@ DASHBOARD_HTML = """
   <!-- SETTINGS TAB -->
   <div id="view-settings" class="card hidden" style="max-width: 550px;">
     <h3 style="margin-bottom: 14px;">Pipeline & CCTV Settings</h3>
+    <div class="form-group"><label><input id="set-stab" type="checkbox" style="width:auto; margin-right:8px;"> Lock Polygons to Camera Motion (ORB Stabilizer)</label></div>
     <div class="form-group"><label>Video Path or RTSP/HTTP CCTV URL</label><input id="set-video" type="text"></div>
     <div class="form-group"><label>Seats Per Table</label><input id="set-seats" type="number"></div>
     <div class="form-group"><label>Occupy Timer (seconds)</label><input id="set-occ" type="number" step="0.5"></div>
@@ -513,6 +515,7 @@ DASHBOARD_HTML = """
       document.getElementById('set-conf').value = s.confidence;
       document.getElementById('set-check').value = s.check_after_seconds;
       document.getElementById('set-infer').value = s.infer_fps;
+      document.getElementById('set-stab').checked = s.stabilize_camera !== false;
     }
 
     async function saveSettings() {
@@ -525,7 +528,8 @@ DASHBOARD_HTML = """
         down_lock_seconds: parseFloat(document.getElementById('set-down').value),
         confidence: parseFloat(document.getElementById('set-conf').value),
         check_after_seconds: parseFloat(document.getElementById('set-check').value),
-        infer_fps: parseFloat(document.getElementById('set-infer').value)
+        infer_fps: parseFloat(document.getElementById('set-infer').value),
+        stabilize_camera: document.getElementById('set-stab').checked
       };
       await fetch('/api/settings', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
       alert('Settings applied & stream restarted!');
