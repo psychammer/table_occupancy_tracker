@@ -14,6 +14,8 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from utilities.pipeline import run_pipeline, DEFAULT_SETTINGS
+from fastapi import FastAPI, Header, HTTPException, Query, Response
+from fastapi.middleware.cors import CORSMiddleware
 
 DB_PATH = "restaurant.db"
 SNAPSHOT_EVERY_SEC = 60   # occupancy snapshot interval, feeds the busy-hours analytics
@@ -131,6 +133,29 @@ async def lifespan(app):
     yield
 
 app = FastAPI(title="TablePulse Restaurant Occupancy System", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/api/snapshot.jpg")
+def get_snapshot():
+    """Single-frame JPEG endpoint for smooth mobile camera preview."""
+    with state_lock:
+        frame_bytes = current_frame_jpeg
+    if not frame_bytes:
+        return Response(status_code=204)
+    return Response(content=frame_bytes, media_type="image/jpeg")
+
+@app.get("/api/events")
+def get_recent_events(since: int = Query(0, ge=0)):
+    """Lightweight JSON polling endpoint for mobile staff alerts."""
+    with events_lock:
+        new_events = [e for e in events_buf if e["id"] > since]
+    return {"events": new_events}
 
 
 # ---------- API ----------
@@ -599,4 +624,4 @@ def index():
 
 if __name__ == "__main__":
     # Bind to localhost until authentication is added (this serves a live camera feed).
-    uvicorn.run(app, host="127.0.0.1", port=8020)
+    uvicorn.run(app, host="0.0.0.0", port=8020)

@@ -1,0 +1,14 @@
+# Python & local data
+__pycache__/
+*.pyc
+.venv/
+venv/
+restaurant.db
+videos/
+*.pt
+
+# Flutter / Dart build artifacts
+kite-flutter-admin-dashboard/build/
+kite-flutter-admin-dashboard/.dart_tool/
+kite-flutter-admin-dashboard/.flutter-plugins
+kite-flutter-admin-dashboard/.flutter-plugins-dependencies

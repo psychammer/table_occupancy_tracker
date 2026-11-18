@@ -1,0 +1,222 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly — catches Flutter SDK drift before a user reports it.
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: '3.47.8'
+  # App payload only — skwasm.wasm (~1.2 MB) comes from gstatic and is shared
+  # across every Flutter web app, so it is excluded. Measured 2026-10-27:
+  # demo 1637 KB, production Auth 1673 KB, with both font tools applied.
+  WASM_GZIP_BUDGET_KB: 1750
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: subosito/flutter-action@v2.23.0
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+      - run: flutter pub get --enforce-lockfile
+      - run: python3 tools/check-l10n.py
+      - run: flutter gen-l10n
+      - run: git diff --exit-code -- lib/l10n
+      - run: dart format --set-exit-if-changed .
+      - run: flutter analyze --fatal-infos
+
+  ui-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: subosito/flutter-action@v2.23.0
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+      - run: flutter pub get
+        working-directory: packages/kite_ui
+      - run: flutter pub get
+        working-directory: packages/kite_ui/example
+      - run: flutter analyze --fatal-infos
+        working-directory: packages/kite_ui
+      - run: flutter test --coverage
+        working-directory: packages/kite_ui
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - run: python3 tools/build-docs.py
+      - run: git diff --exit-code -- docs/site
+
+  auth-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: supabase/setup-cli@v3.0.1
+        with:
+          version: 2.122.0
+      - run: node tools/local-supabase.mjs start
+      - run: node tools/auth-e2e.mjs
+      - if: always()
+        run: node tools/local-supabase.mjs stop
+
+  role-policies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - run: npm ci --prefix tools/policy-tests --ignore-scripts
+      - run: npm test --prefix tools/policy-tests
+
+  architecture:
+    # The one rule that matters: features never import the design library directly.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: No shadcn_ui imports outside packages/kite_ui/
+        run: |
+          # The app reaches shadcn only through package:kite_ui/shadcn.dart.
+          # Naming shadcn_ui anywhere in lib/ defeats the point of the layer.
+          if grep -rn --include='*.dart' "package:shadcn_ui" lib; then
+            echo "::error::shadcn_ui imported outside packages/kite_ui/ — see docs/ARCHITECTURE.md"
+            exit 1
+          fi
+          echo "OK: design library confined to packages/kite_ui/"
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: subosito/flutter-action@v2.23.0
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+      - run: flutter pub get --enforce-lockfile
+      - run: flutter test --coverage
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: web-wasm
+            os: ubuntu-latest
+            cmd: flutter build web --wasm --release
+          - target: web-auth
+            os: ubuntu-latest
+            cmd: flutter build web --wasm --release --dart-define-from-file=config/production.example.json
+          - target: web-js
+            os: ubuntu-latest
+            cmd: flutter build web --release
+          - target: android
+            os: ubuntu-latest
+            cmd: flutter build apk --release
+          - target: ios
+            os: macos-latest
+            cmd: flutter build ios --release --no-codesign
+          - target: macos
+            os: macos-latest
+            cmd: flutter build macos --release
+          - target: windows
+            os: windows-latest
+            cmd: flutter build windows --release
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: subosito/flutter-action@v2.23.0
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+      - run: flutter pub get --enforce-lockfile
+      - run: ${{ matrix.cmd }}
+
+  size:
+    # The bundle cannot silently bloat. The README quotes a number; this keeps it true.
+    needs: build
+    strategy:
+      matrix:
+        include:
+          - mode: demo
+            defines: ''
+          - mode: production-auth
+            defines: --dart-define-from-file=config/production.example.json
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: subosito/flutter-action@v2.23.0
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+      - run: flutter pub get --enforce-lockfile
+      - run: flutter build web --wasm --release ${{ matrix.defines }}
+      - run: node tools/strip-fonts.mjs build/web
+      - name: Subset the Lucide face
+        run: |
+          pip install --quiet fonttools
+          python3 tools/subset-lucide.py build/web
+      - name: Measure gzipped app payload
+        # NOTE: build/web ships SIX mutually-exclusive renderer variants plus .symbols
+        # debug files. Summing the directory reports ~13 MB against a real 2.4 MB.
+        # Measure only what this app actually ships: its own wasm + declared assets.
+        run: |
+          total=0
+          for f in build/web/main.dart.wasm build/web/main.dart.mjs \
+                   build/web/flutter_bootstrap.js build/web/index.html; do
+            [ -f "$f" ] || continue
+            total=$((total + $(gzip -c "$f" | wc -c)))
+          done
+          while IFS= read -r f; do
+            total=$((total + $(gzip -c "$f" | wc -c)))
+          done < <(find build/web/assets -type f)
+          kb=$((total / 1024))
+          echo "App payload: ${kb} KB gzip (budget ${WASM_GZIP_BUDGET_KB} KB)" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$kb" -gt "${WASM_GZIP_BUDGET_KB}" ]; then
+            echo "::error::App payload ${kb} KB exceeds budget ${WASM_GZIP_BUDGET_KB} KB"
+            exit 1
+          fi
+
+  fonts:
+    # Regression guard for the biggest finding in Spike A: shadcn_ui pulls in seven
+    # Lucide font families and Flutter preloads every declared family.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: subosito/flutter-action@v2.23.0
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+      - run: flutter pub get --enforce-lockfile
+      - run: flutter build web --wasm --release
+      - name: Drop Lucide variable-weight instances
+        run: node tools/strip-fonts.mjs build/web
+      - name: Subset the Lucide face to the glyphs actually drawn
+        run: |
+          pip install --quiet fonttools
+          python3 tools/subset-lucide.py build/web
+      - name: Exactly one Lucide family must survive
+        # >1 means the strip step regressed and ~1.15 MB of unused weights ship.
+        #  0 means the BASE family was dropped too, which leaves tofu boxes where
+        #    shadcn's own icons should be. Both are failures. See docs/SPIKE-B-C.md
+        run: |
+          n=$(grep -o '"family":"[^"]*Lucide[^"]*"' \
+                build/web/assets/FontManifest.json | wc -l | tr -d ' ')
+          echo "Lucide families surviving: $n (expected exactly 1)"
+          if [ "$n" -ne 1 ]; then
+            echo "::error::Expected exactly 1 Lucide family, found $n. See docs/SPIKE-B-C.md"
+            exit 1
+          fi

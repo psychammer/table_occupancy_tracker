@@ -1,0 +1,98 @@
+# tools/
+
+## measure-bundle.mjs
+
+Spike A's measurement harness. Serves a Flutter web build over gzip, loads it in headless
+Chromium, and reports **real browser transfer** (encoded bytes over the wire) plus FCP.
+
+Do not measure by summing files in `build/web` — it ships six mutually-exclusive renderer
+variants and reports ~5.5x the real figure. See `docs/SPIKE-A.md`.
+
+```bash
+npm i playwright && npx playwright install chromium
+node tools/measure-bundle.mjs build/web "label"            # unthrottled
+node tools/measure-bundle.mjs build/web "label" throttle    # Fast 4G + 4x CPU
+```
+
+Note: LCP always reports 0 for Flutter — it renders to canvas, so no LCP-eligible element
+exists. Use FCP.
+
+## strip-fonts.mjs
+
+Drops the six Lucide variable-weight font instances (`Lucide100`..`Lucide600`).
+Flutter web preloads every family declared in `FontManifest.json`, so all seven
+download on first paint even though nothing references the numbered weights.
+
+Keeps the base `Lucide` family — shadcn's own components draw from it, and
+dropping it leaves tofu boxes where the chevrons should be.
+
+```bash
+node tools/strip-fonts.mjs build/web
+```
+
+## subset-lucide.py
+
+Then subsets that base face to the glyphs the build actually draws.
+`--tree-shake-icons` only manages ~12% here because shadcn reaches its icons
+through wrappers that defeat Flutter's static analysis — but it only ever draws
+about a dozen. 1,776 glyphs to 12; 732 KB to 2 KB.
+
+```bash
+pip install fonttools
+python3 tools/subset-lucide.py build/web
+```
+
+Both run in CI before the size gate. Together they take the app payload from
+2,240 KB to 1,562 KB.
+
+## record-demo.mjs + build-gif.py
+
+The README demo. Flutter renders to a canvas, so Playwright's video recording
+and `fullPage` screenshots both fall over — frames are captured one at a time
+and assembled by Pillow, no ffmpeg involved.
+
+```bash
+node tools/record-demo.mjs build/web /tmp/kite-frames
+python3 tools/build-gif.py /tmp/kite-frames docs/demo.gif --width 900 --ms 380
+```
+
+`build-gif.py` derives one palette for the whole run from sampled frames, so it
+covers both themes rather than whichever the first frame used, and merges runs
+of identical frames into a single frame with a longer duration — GIF
+optimisation drops duplicates otherwise, which removes the pause instead of
+shortening it.
+
+**The recorder clicks the sidebar by coordinate.** Adding a nav item shifts
+everything below it and the recording lands on the wrong screens. Positions and
+spacing are documented in the `NAV` constant.
+
+## Authentication, policies, and localization
+
+- `node tools/local-supabase.mjs start|status|stop`: manage the isolated local
+  `kite-e2e` stack. Requires Supabase CLI 2.122.0 and a Docker-compatible runtime.
+- `node tools/configure-local-supabase.mjs`: write ignored local Flutter config
+  with public client settings; service-role credentials never enter the app.
+- `node tools/auth-e2e.mjs`: test real confirmation, password sign-in, PKCE
+  recovery, role permissions and revocation. Loopback-only; cleans up fixtures.
+  Writes a credential-free report to `build/e2e/auth-report.json`.
+- `node tools/local-role.mjs email@example.test viewer|editor|admin|none`:
+  assign access in the local test stack only.
+- `npm ci --prefix tools/policy-tests --ignore-scripts`, then
+  `npm test --prefix tools/policy-tests`: run the migration in PostgreSQL/Wasm
+  and test authorization independently of the Auth service.
+- `python3 tools/check-l10n.py`: require complete keys and matching placeholders
+  across all five ARB catalogs. Run `flutter gen-l10n` after editing translations.
+- `python3 tools/build-docs.py`: rebuild committed `docs/site/` from `docs/src/`.
+
+See [authentication setup](../docs/AUTHENTICATION.md) for local and hosted
+configuration, SMTP, initial role assignment, callbacks, and storage tradeoffs.
+See [release guide](../docs/RELEASING.md) for validation and deployment.
+
+## Cache purging
+
+`./tools/purge-demo.sh https://demo.dashboardpack.com/kite build/web` purges the
+shell, build files, and common SPA entry points through the existing `hetzner`
+Cloudflare purge helper. `./tools/purge-docs.sh` purges every generated HTML/CSS
+page. Run these after an upload so cached bootstrap and documentation files do
+not lag behind R2. Both require the configured SSH access; no API token is
+written into this repository.
