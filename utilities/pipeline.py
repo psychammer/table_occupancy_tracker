@@ -25,11 +25,16 @@ DEFAULT_SETTINGS = {
     "up_lock_seconds": 2.0,
     "down_lock_seconds": 10.0,
     "check_after_seconds": 300.0,
+    "clear_alert_seconds": 180.0,     # Alert staff if dirty table > 3 mins
+    "vacant_alert_seconds": 900.0,    # Alert staff if free table vacant > 15 mins
+    "target_dining_minutes": 75.0,    # Target duration for turnover simulator
+    "avg_spend_php": 500.0,           # Average spend per customer (PHP)
+    "operating_hours": 10.0,          # Daily operating hours
     "min_visit_seconds": 20.0,
     "require_clearing": True,
     "seats_per_table": 4,
     "display_size": (1280, 720),
-    "stabilize_camera": True,                     # <--- Added setting
+    "stabilize_camera": True,
 }
 
 GREEN = (0, 200, 0)
@@ -164,7 +169,7 @@ def _empty_info(tables, seats):
     }
 
 
-def run_pipeline(settings=None, on_visit_end=None, on_event=None,
+def run_pipeline(settings=None, on_visit_end=None, on_table_cleared=None, on_event=None,
                  should_stop=None, commands=None):
     cfg = {**DEFAULT_SETTINGS, **(settings or {})}
     ensure_default_table_files()
@@ -176,12 +181,17 @@ def run_pipeline(settings=None, on_visit_end=None, on_event=None,
 
     det_model, pose_model = get_models(cfg)
     source = VideoSource(cfg["video_path"])
-    stabilizer = CameraStabilizer()               # <--- Initialize stabilizer
+    stabilizer = CameraStabilizer()
 
     tcfg = TableConfig(
-        occupy_seconds=cfg["occupy_seconds"], free_seconds=cfg["free_seconds"],
-        up_lock_seconds=cfg["up_lock_seconds"], down_lock_seconds=cfg["down_lock_seconds"],
-        check_after_seconds=cfg["check_after_seconds"], min_visit_seconds=cfg["min_visit_seconds"],
+        occupy_seconds=cfg["occupy_seconds"],
+        free_seconds=cfg["free_seconds"],
+        up_lock_seconds=cfg["up_lock_seconds"],
+        down_lock_seconds=cfg["down_lock_seconds"],
+        check_after_seconds=cfg["check_after_seconds"],
+        clear_alert_seconds=cfg.get("clear_alert_seconds", 180.0),
+        vacant_alert_seconds=cfg.get("vacant_alert_seconds", 900.0),
+        min_visit_seconds=cfg["min_visit_seconds"],
         require_clearing=cfg["require_clearing"],
     )
     states = {t: TableState(t, tcfg) for t in tables}
@@ -191,9 +201,20 @@ def run_pipeline(settings=None, on_visit_end=None, on_event=None,
         for e in events:
             d = e.to_dict()
             if e.type == "GUESTS_LEFT" and on_visit_end:
-                on_visit_end({"table_name": e.table, "guests": d["guests"],
-                              "duration_sec": d["duration_sec"],
-                              "start_ts": d["start_ts"], "end_ts": d["end_ts"]})
+                on_visit_end({
+                    "table_name": e.table,
+                    "guests": d["guests"],
+                    "duration_sec": d["duration_sec"],
+                    "start_ts": d["start_ts"],
+                    "end_ts": d["end_ts"],
+                })
+            elif e.type == "CLEARED" and on_table_cleared:
+                on_table_cleared({
+                    "table_name": e.table,
+                    "clear_duration_sec": d.get("clear_duration_sec", 0.0),
+                    "auto": d.get("auto", False),
+                    "ts": datetime.fromtimestamp(e.ts).strftime("%Y-%m-%d %H:%M:%S"),
+                })
             if on_event:
                 on_event(d)
 

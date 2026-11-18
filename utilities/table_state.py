@@ -1,8 +1,8 @@
 """
 Per-table state machine: FREE -> OCCUPIED -> NEEDS_CLEARING -> FREE.
 
-Pure logic, no OpenCV/YOLO. Feed it a person count and a monotonic timestamp
-and it returns a list of Events. Easy to unit test without any video.
+Tracks dining duration, bussing/clearing speed, overdue bussing alerts,
+and prolonged vacancy alerts to maximize table turnover.
 """
 import time
 from collections import deque
@@ -20,7 +20,9 @@ class State(str, Enum):
 
 @dataclass
 class Event:
-    type: str            # SEATED | CHECK_ON_TABLE | GUESTS_LEFT | NEEDS_CLEARING | CLEARED
+    # Types: SEATED | CHECK_ON_TABLE | GUESTS_LEFT | NEEDS_CLEARING |
+    #        CLEARING_OVERDUE | CLEARED | VACANT_TOO_LONG
+    type: str
     table: str
     ts: float            # wall-clock epoch seconds
     data: dict = field(default_factory=dict)
@@ -37,15 +39,17 @@ class Event:
 
 @dataclass
 class TableConfig:
-    occupy_seconds: float = 3.0         # people must be present this long to count as seated
-    free_seconds: float = 20.0          # table must be empty this long to count as left
-    up_lock_seconds: float = 2.0        # accept a higher guest count after this long
-    down_lock_seconds: float = 10.0     # accept a lower guest count after this long
-    smooth_seconds: float = 3.0         # median window for raw counts
-    check_after_seconds: float = 300.0  # "check on table" alert (5 min)
-    min_visit_seconds: float = 20.0     # shorter visits are treated as noise
-    require_clearing: bool = True       # go through NEEDS_CLEARING before FREE
-    auto_clear_seconds: float = 0.0     # 0 = wait for staff to press "cleared"
+    occupy_seconds: float = 3.0          # people must be present this long to count as seated
+    free_seconds: float = 20.0           # table must be empty this long to count as left
+    up_lock_seconds: float = 2.0         # accept a higher guest count after this long
+    down_lock_seconds: float = 10.0      # accept a lower guest count after this long
+    smooth_seconds: float = 3.0          # median window for raw counts
+    check_after_seconds: float = 300.0   # "check on table" alert (5 min)
+    clear_alert_seconds: float = 180.0   # alert if dirty table isn't cleared within 3 min
+    vacant_alert_seconds: float = 900.0  # alert if free table sits empty > 15 min
+    min_visit_seconds: float = 20.0      # shorter visits are treated as noise
+    require_clearing: bool = True        # go through NEEDS_CLEARING before FREE
+    auto_clear_seconds: float = 0.0      # 0 = wait for staff to press "cleared"
 
 
 def _fmt(epoch):
@@ -61,6 +65,10 @@ class TableState:
         self.peak = 0
         self._reset_visit()
         self._dirty_since = None
+        self._dirty_wall = None
+        self._clear_alert_sent = False
+        self._free_since = time.monotonic()
+        self._vacant_alert_sent = False
 
     def _reset_visit(self):
         self._present_since = None
@@ -88,22 +96,50 @@ class TableState:
                 self._present_since = now
             if now - self._present_since >= self.cfg.occupy_seconds:
                 if self.state is State.NEEDS_CLEARING:
-                    events.append(self._event("CLEARED", auto=True))
+                    clear_dur = round(now - self._dirty_since, 1) if self._dirty_since else 0.0
+                    events.append(self._event("CLEARED", auto=True, clear_duration_sec=clear_dur))
+                    self._dirty_since = None
+                    self._clear_alert_sent = False
                 self._seat(raw_count, now, events)
         else:
             self._present_since = None
-            if (self.state is State.NEEDS_CLEARING and self.cfg.auto_clear_seconds > 0
-                    and now - self._dirty_since >= self.cfg.auto_clear_seconds):
-                self.state = State.FREE
-                events.append(self._event("CLEARED", auto=True))
+            if self.state is State.NEEDS_CLEARING and self._dirty_since is not None:
+                dirty_elapsed = now - self._dirty_since
+                if (not self._clear_alert_sent
+                        and self.cfg.clear_alert_seconds > 0
+                        and dirty_elapsed >= self.cfg.clear_alert_seconds):
+                    self._clear_alert_sent = True
+                    events.append(self._event("CLEARING_OVERDUE", dirty_sec=int(dirty_elapsed)))
+
+                if self.cfg.auto_clear_seconds > 0 and dirty_elapsed >= self.cfg.auto_clear_seconds:
+                    clear_dur = round(dirty_elapsed, 1)
+                    self.state = State.FREE
+                    self._dirty_since = None
+                    self._clear_alert_sent = False
+                    self._free_since = now
+                    self._vacant_alert_sent = False
+                    events.append(self._event("CLEARED", auto=True, clear_duration_sec=clear_dur))
+
+            elif self.state is State.FREE and self._free_since is not None:
+                idle_elapsed = now - self._free_since
+                if (not self._vacant_alert_sent
+                        and self.cfg.vacant_alert_seconds > 0
+                        and idle_elapsed >= self.cfg.vacant_alert_seconds):
+                    self._vacant_alert_sent = True
+                    events.append(self._event("VACANT_TOO_LONG", vacant_sec=int(idle_elapsed)))
+
         return events
 
     def mark_cleared(self, now: float):
-        """Staff pressed 'cleared' in the dashboard."""
+        """Staff pressed 'cleared' in the dashboard or mobile app."""
         if self.state is State.NEEDS_CLEARING:
+            clear_dur = round(now - self._dirty_since, 1) if self._dirty_since else 0.0
             self.state = State.FREE
             self._dirty_since = None
-            return [self._event("CLEARED", auto=False)]
+            self._clear_alert_sent = False
+            self._free_since = now
+            self._vacant_alert_sent = False
+            return [self._event("CLEARED", auto=False, clear_duration_sec=clear_dur)]
         return []
 
     def force_end(self, now: float):
@@ -115,21 +151,29 @@ class TableState:
 
     def snapshot(self, now: float):
         occupied = self.state is State.OCCUPIED
+        needs_clearing = self.state is State.NEEDS_CLEARING
+        is_free = self.state is State.FREE
         dur = int(now - self._seated_mono) if occupied else 0
-        dirty = int(now - self._dirty_since) if self.state is State.NEEDS_CLEARING else 0
+        dirty = int(now - self._dirty_since) if needs_clearing and self._dirty_since else 0
+        vacant = int(now - self._free_since) if is_free and self._free_since else 0
         return {
             "state": self.state.value,
             "occupied": occupied,
             "guests": self.guests if occupied else 0,
             "duration_sec": dur,
             "dirty_sec": dirty,
+            "vacant_sec": vacant,
             "check_due": occupied and dur >= self.cfg.check_after_seconds,
+            "clearing_overdue": needs_clearing and self.cfg.clear_alert_seconds > 0 and dirty >= self.cfg.clear_alert_seconds,
+            "vacant_overdue": is_free and self.cfg.vacant_alert_seconds > 0 and vacant >= self.cfg.vacant_alert_seconds,
         }
 
     # ---------- internals ----------
     def _seat(self, raw, now, events):
         self._reset_visit()
         self.state = State.OCCUPIED
+        self._free_since = None
+        self._vacant_alert_sent = False
         self._seated_mono = now
         self._seated_wall = time.time()
         self._samples.append((now, raw))
@@ -141,7 +185,7 @@ class TableState:
         c = self.cfg
         if raw > 0:
             self._empty_since = None
-            self._samples.append((now, raw))   # zeros are not sampled: occlusion shouldn't lower the count
+            self._samples.append((now, raw))
         elif self._empty_since is None:
             self._empty_since = now
 
@@ -181,7 +225,6 @@ class TableState:
         self.peak = max(self.peak, self.guests)
 
     def _end_visit(self, now, events, clearing=True):
-        # People actually left when the table first went empty, not when the timer expired.
         end_mono = self._empty_since if self._empty_since is not None else now
         end_wall = time.time() - (now - end_mono)
         dur = end_mono - self._seated_mono
@@ -195,9 +238,13 @@ class TableState:
         if valid and clearing and self.cfg.require_clearing:
             self.state = State.NEEDS_CLEARING
             self._dirty_since = now
+            self._dirty_wall = time.time()
+            self._clear_alert_sent = False
             events.append(self._event("NEEDS_CLEARING", guests=max(1, self.peak)))
         else:
             self.state = State.FREE
+            self._free_since = now
+            self._vacant_alert_sent = False
         self.guests = 0
         self.peak = 0
         self._reset_visit()

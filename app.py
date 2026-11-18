@@ -9,13 +9,12 @@ from datetime import datetime, timedelta
 from contextlib import contextmanager, asynccontextmanager
 import cv2
 import uvicorn
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from utilities.pipeline import run_pipeline, DEFAULT_SETTINGS
-from fastapi import FastAPI, Header, HTTPException, Query, Response
-from fastapi.middleware.cors import CORSMiddleware
 
 DB_PATH = "restaurant.db"
 SNAPSHOT_EVERY_SEC = 60   # occupancy snapshot interval, feeds the busy-hours analytics
@@ -52,7 +51,16 @@ def init_db():
         conn.execute("""
             CREATE TABLE IF NOT EXISTS visits (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                table_name TEXT, guests INTEGER, duration_sec REAL, timestamp TEXT
+                table_name TEXT, guests INTEGER, duration_sec REAL, timestamp TEXT,
+                start_ts TEXT, end_ts TEXT, clear_duration_sec REAL DEFAULT 0
+            )""")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS clearings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_name TEXT NOT NULL,
+                clear_duration_sec REAL NOT NULL,
+                auto_cleared INTEGER DEFAULT 0,
+                ts TEXT NOT NULL
             )""")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS snapshots (
@@ -61,10 +69,11 @@ def init_db():
                 guests INTEGER, total_tables INTEGER
             )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_ts ON snapshots(ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_clearings_ts ON clearings(ts)")
         cols = {r[1] for r in conn.execute("PRAGMA table_info(visits)")}
-        for col in ("start_ts", "end_ts"):          # migrate older databases
+        for col, col_type in (("start_ts", "TEXT"), ("end_ts", "TEXT"), ("clear_duration_sec", "REAL DEFAULT 0")):
             if col not in cols:
-                conn.execute(f"ALTER TABLE visits ADD COLUMN {col} TEXT")
+                conn.execute(f"ALTER TABLE visits ADD COLUMN {col} {col_type}")
 
 def log_visit(v: dict):
     with db() as conn:
@@ -72,6 +81,23 @@ def log_visit(v: dict):
             "INSERT INTO visits (table_name, guests, duration_sec, timestamp, start_ts, end_ts) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (v["table_name"], v["guests"], v["duration_sec"], v["end_ts"], v["start_ts"], v["end_ts"]))
+
+def log_clearing(c: dict):
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO clearings (table_name, clear_duration_sec, auto_cleared, ts) VALUES (?, ?, ?, ?)",
+            (c["table_name"], c["clear_duration_sec"], 1 if c.get("auto") else 0, c["ts"])
+        )
+        # Also attach clear_duration_sec to the most recent visit for that table
+        conn.execute("""
+            UPDATE visits
+            SET clear_duration_sec = ?
+            WHERE id = (
+                SELECT id FROM visits
+                WHERE table_name = ?
+                ORDER BY id DESC LIMIT 1
+            )
+        """, (c["clear_duration_sec"], c["table_name"]))
 
 def push_event(e: dict):
     global event_seq
@@ -85,7 +111,6 @@ def push_event(e: dict):
 def video_worker():
     global current_frame_jpeg, current_stats, frame_version
     while True:
-        # Clear BEFORE snapshotting settings: a restart requested from now on is never lost.
         restart_event.clear()
         with state_lock:
             settings = current_settings.copy()
@@ -93,6 +118,7 @@ def video_worker():
             for frame, info in run_pipeline(
                 settings=settings,
                 on_visit_end=log_visit,
+                on_table_cleared=log_clearing,
                 on_event=push_event,
                 should_stop=restart_event.is_set,
                 commands=commands,
@@ -103,12 +129,12 @@ def video_worker():
                         current_frame_jpeg = buf.tobytes()
                         current_stats = info
                         frame_version += 1
-        except Exception as exc:   # keep the worker alive on bad settings / model errors
+        except Exception as exc:
             print(f"[pipeline] crashed: {exc!r}; retrying in 3s")
             time.sleep(3)
 
 def snapshot_worker():
-    """Visits alone can't say 'how full were we at 7pm', so sample occupancy on a fixed interval."""
+    """Sample occupancy on a fixed interval to feed busy-hours analytics."""
     while True:
         time.sleep(SNAPSHOT_EVERY_SEC)
         with state_lock:
@@ -133,6 +159,7 @@ async def lifespan(app):
     yield
 
 app = FastAPI(title="TablePulse Restaurant Occupancy System", lifespan=lifespan)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -140,22 +167,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-@app.get("/api/snapshot.jpg")
-def get_snapshot():
-    """Single-frame JPEG endpoint for smooth mobile camera preview."""
-    with state_lock:
-        frame_bytes = current_frame_jpeg
-    if not frame_bytes:
-        return Response(status_code=204)
-    return Response(content=frame_bytes, media_type="image/jpeg")
-
-@app.get("/api/events")
-def get_recent_events(since: int = Query(0, ge=0)):
-    """Lightweight JSON polling endpoint for mobile staff alerts."""
-    with events_lock:
-        new_events = [e for e in events_buf if e["id"] > since]
-    return {"events": new_events}
 
 
 # ---------- API ----------
@@ -166,11 +177,19 @@ def video_feed():
         while True:
             with state_lock:
                 frame_bytes, ver = current_frame_jpeg, frame_version
-            if frame_bytes and ver != last:     # only send new frames
+            if frame_bytes and ver != last:
                 last = ver
                 yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
             time.sleep(0.03)
     return StreamingResponse(generate(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+@app.get("/api/snapshot.jpg")
+def get_snapshot():
+    with state_lock:
+        frame_bytes = current_frame_jpeg
+    if not frame_bytes:
+        return Response(status_code=204)
+    return Response(content=frame_bytes, media_type="image/jpeg")
 
 @app.get("/api/stats")
 def get_stats():
@@ -181,16 +200,30 @@ def get_stats():
 def get_history():
     with db() as conn:
         rows = conn.execute(
-            "SELECT id, table_name, guests, duration_sec, COALESCE(end_ts, timestamp) "
+            "SELECT id, table_name, guests, duration_sec, COALESCE(clear_duration_sec, 0), COALESCE(end_ts, timestamp) "
             "FROM visits ORDER BY id DESC LIMIT 50").fetchall()
     return {"history": [{"id": r[0], "table_name": r[1], "guests": r[2],
-                         "duration_sec": r[3], "timestamp": r[4]} for r in rows]}
+                         "duration_sec": r[3], "clear_duration_sec": round(r[4] or 0, 1),
+                         "timestamp": r[5]} for r in rows]}
 
 @app.get("/api/analytics")
 def analytics(days: int = Query(30, ge=1, le=365), tables_per_server: int = Query(4, ge=1, le=50)):
-    """Busy-hours data: weekday x hour heatmap of average occupied tables + staffing hint."""
+    """
+    Returns busy-hours heatmap, staffing hints, per-table turnover speed rankings,
+    seating fill efficiency, and the PHP Turnover & Revenue Simulator.
+    """
     since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     vts = "COALESCE(start_ts, timestamp)"
+
+    with state_lock:
+        cfg = current_settings.copy()
+        live_total_tables = current_stats.get("total_tables", 0) or 10
+
+    seats_per_table = cfg.get("seats_per_table", 4)
+    target_dining_min = cfg.get("target_dining_minutes", 75.0)
+    avg_spend_php = cfg.get("avg_spend_php", 500.0)
+    operating_hours = cfg.get("operating_hours", 10.0)
+
     with db() as conn:
         snaps = conn.execute(
             "SELECT CAST(strftime('%w', ts) AS INTEGER), CAST(strftime('%H', ts) AS INTEGER), "
@@ -199,11 +232,29 @@ def analytics(days: int = Query(30, ge=1, le=365), tables_per_server: int = Quer
             f"SELECT CAST(strftime('%w', {vts}) AS INTEGER), CAST(strftime('%H', {vts}) AS INTEGER), COUNT(*) "
             f"FROM visits WHERE {vts} >= ? GROUP BY 1, 2", (since,)).fetchall()
         v_tot = conn.execute(
-            f"SELECT COUNT(*), AVG(duration_sec), AVG(guests) FROM visits WHERE {vts} >= ?", (since,)).fetchone()
+            f"SELECT COUNT(*), AVG(duration_sec), AVG(guests), AVG(COALESCE(clear_duration_sec, 0)) "
+            f"FROM visits WHERE {vts} >= ?", (since,)).fetchone()
+        c_tot = conn.execute(
+            "SELECT COUNT(*), AVG(clear_duration_sec), MIN(clear_duration_sec), MAX(clear_duration_sec) "
+            "FROM clearings WHERE ts >= ?", (since,)).fetchone()
         s_tot = conn.execute(
             "SELECT MAX(occupied), MAX(total_tables), COUNT(*) FROM snapshots WHERE ts >= ?", (since,)).fetchone()
 
-    heat = [[0.0] * 24 for _ in range(7)]       # avg occupied tables, index [weekday 0=Sun][hour]
+        # Per-table turnover & seating efficiency breakdown
+        per_table_rows = conn.execute(f"""
+            SELECT
+                table_name,
+                COUNT(*) AS turns,
+                AVG(duration_sec) AS avg_dining_sec,
+                AVG(COALESCE(clear_duration_sec, 0)) AS avg_clear_sec,
+                AVG(guests) AS avg_guests,
+                SUM(CASE WHEN guests <= ? THEN 1 ELSE 0 END) AS under_seated_visits
+            FROM visits
+            WHERE {vts} >= ?
+            GROUP BY table_name
+        """, (max(1, seats_per_table // 2), since)).fetchall()
+
+    heat = [[0.0] * 24 for _ in range(7)]
     guests = [[0.0] * 24 for _ in range(7)]
     visit_counts = [[0] * 24 for _ in range(7)]
     for wd, hr, occ, g, _n in snaps:
@@ -220,23 +271,119 @@ def analytics(days: int = Query(30, ge=1, le=365), tables_per_server: int = Quer
                    reverse=True)[:3]
     busiest = [{"weekday": wd, "hour": hr, "avg_occupied": occ,
                 "servers_needed": math.ceil(occ / tables_per_server)} for occ, wd, hr in slots]
+
+    # Build per-table turnover list (sorted slowest cycle time first)
+    table_turnover = []
+    seating_opportunities = []
+    for row in per_table_rows:
+        t_name, turns, avg_din, avg_clr, avg_g, under_visits = row
+        avg_din = round(avg_din or 0.0, 1)
+        avg_clr = round(avg_clr or 0.0, 1)
+        cycle_sec = round(avg_din + avg_clr, 1)
+        avg_g = round(avg_g or 0.0, 2)
+        seat_eff_pct = round((avg_g / max(1, seats_per_table)) * 100.0, 1)
+        under_pct = round(((under_visits or 0) / max(1, turns)) * 100.0, 1)
+
+        item = {
+            "table_name": t_name,
+            "turns": turns,
+            "avg_dining_sec": avg_din,
+            "avg_clear_sec": avg_clr,
+            "avg_cycle_sec": cycle_sec,
+            "avg_guests": avg_g,
+            "seat_efficiency_pct": seat_eff_pct,
+            "small_party_pct": under_pct,
+        }
+        table_turnover.append(item)
+
+        if seat_eff_pct < 60.0 and turns >= 1:
+            seating_opportunities.append(
+                f"{t_name} averages {avg_g} guests on a {seats_per_table}-seat table ({seat_eff_pct}% seat fill). "
+                f"Consider splitting into 2-tops or prioritizing larger parties here."
+            )
+
+    table_turnover.sort(key=lambda x: x["avg_cycle_sec"], reverse=True)
+    slowest_tables = table_turnover[:3]
+
+    # Turnover & Revenue Impact Simulator (PHP)
+    # Uses observed average cycle time if available, or defaults to 90 min baseline
+    observed_dining_min = round((v_tot[1] or 5400.0) / 60.0, 1) if (v_tot[0] or 0) > 0 else 90.0
+    observed_clear_min = round((c_tot[1] or v_tot[3] or 0.0) / 60.0, 1)
+    baseline_cycle_min = max(15.0, observed_dining_min + observed_clear_min) if (v_tot[0] or 0) > 0 else 90.0
+    target_cycle_min = max(10.0, target_dining_min)
+
+    num_tables = s_tot[1] or live_total_tables or 10
+    avg_party = round(v_tot[2] or 2.5, 2)
+    operating_minutes = operating_hours * 60.0
+
+    current_turns_per_table = round(operating_minutes / baseline_cycle_min, 2)
+    target_turns_per_table = round(operating_minutes / target_cycle_min, 2)
+
+    current_daily_sessions = round(num_tables * current_turns_per_table, 1)
+    target_daily_sessions = round(num_tables * target_turns_per_table, 1)
+    extra_daily_sessions = round(max(0.0, target_daily_sessions - current_daily_sessions), 1)
+    extra_daily_guests = round(extra_daily_sessions * avg_party, 1)
+
+    # Revenue calculation: each customer spends avg_spend_php
+    current_daily_rev_php = round(current_daily_sessions * avg_party * avg_spend_php, 2)
+    target_daily_rev_php = round(target_daily_sessions * avg_party * avg_spend_php, 2)
+    extra_daily_rev_php = round(max(0.0, target_daily_rev_php - current_daily_rev_php), 2)
+    extra_monthly_rev_php = round(extra_daily_rev_php * 30.0, 2)
+
+    overall_seat_eff_pct = round(((v_tot[2] or 0) / max(1, seats_per_table)) * 100.0, 1) if (v_tot[0] or 0) > 0 else 0.0
+
     return {
-        "days": days, "tables_per_server": tables_per_server,
+        "days": days,
+        "tables_per_server": tables_per_server,
         "summary": {
             "visits": v_tot[0] or 0,
             "avg_duration_sec": round(v_tot[1] or 0, 1),
+            "avg_clear_sec": round(c_tot[1] or v_tot[3] or 0, 1),
+            "fastest_clear_sec": round(c_tot[2] or 0, 1),
+            "slowest_clear_sec": round(c_tot[3] or 0, 1),
+            "total_clearings": c_tot[0] or 0,
             "avg_party_size": round(v_tot[2] or 0, 1),
+            "seat_efficiency_pct": overall_seat_eff_pct,
             "peak_occupied": s_tot[0] or 0,
-            "total_tables": s_tot[1] or 0,
+            "total_tables": num_tables,
             "snapshots": s_tot[2] or 0,
         },
-        "heatmap": heat, "guests": guests, "visit_counts": visit_counts,
-        "by_hour": by_hour, "busiest": busiest,
+        "turnover_ranking": table_turnover,
+        "slowest_tables": slowest_tables,
+        "seating_opportunities": seating_opportunities,
+        "turnover_simulator": {
+            "tables": num_tables,
+            "operating_hours": operating_hours,
+            "avg_spend_php": avg_spend_php,
+            "avg_party_size": avg_party,
+            "current_cycle_min": baseline_cycle_min,
+            "target_cycle_min": target_cycle_min,
+            "current_daily_sessions": current_daily_sessions,
+            "target_daily_sessions": target_daily_sessions,
+            "extra_daily_sessions": extra_daily_sessions,
+            "extra_daily_guests": extra_daily_guests,
+            "current_daily_revenue_php": current_daily_rev_php,
+            "target_daily_revenue_php": target_daily_rev_php,
+            "extra_daily_revenue_php": extra_daily_rev_php,
+            "extra_monthly_revenue_php": extra_monthly_rev_php,
+        },
+        "heatmap": heat,
+        "guests": guests,
+        "visit_counts": visit_counts,
+        "by_hour": by_hour,
+        "busiest": busiest,
     }
+
+@app.get("/api/events")
+def get_recent_events(since: int = Query(0, ge=0)):
+    """Lightweight JSON polling endpoint for the Flutter mobile app."""
+    with events_lock:
+        new_events = [e for e in events_buf if e["id"] > since]
+    return {"events": new_events}
 
 @app.get("/api/events/stream")
 def events_stream(since: int | None = None, last_event_id: str | None = Header(default=None)):
-    """Server-Sent Events. Browsers resend Last-Event-ID on reconnect, so no alert is missed."""
+    """Server-Sent Events for real-time staff notifications."""
     with events_lock:
         latest = event_seq
     if last_event_id and last_event_id.isdigit():
@@ -276,6 +423,11 @@ class SettingsUpdate(BaseModel):
     down_lock_seconds: float = Field(ge=0, le=600)
     confidence: float = Field(gt=0, lt=1)
     check_after_seconds: float = Field(default=300, ge=10, le=7200)
+    clear_alert_seconds: float = Field(default=180, ge=10, le=3600)
+    vacant_alert_seconds: float = Field(default=900, ge=30, le=14400)
+    target_dining_minutes: float = Field(default=75, ge=15, le=300)
+    avg_spend_php: float = Field(default=500, ge=1, le=100000)
+    operating_hours: float = Field(default=10, ge=1, le=24)
     infer_fps: float = Field(default=4, ge=0.5, le=30)
     stabilize_camera: bool = Field(default=True)
 
@@ -303,7 +455,7 @@ DASHBOARD_HTML = """
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>TablePulse — Restaurant Occupancy System</title>
+  <title>TablePulse — Restaurant Occupancy & Turnover System</title>
   <style>
     :root { --bg: #0f172a; --card: #1e293b; --text: #f8fafc; --muted: #94a3b8; --green: #22c55e; --red: #ef4444; --accent: #38bdf8; }
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, -apple-system, sans-serif; }
@@ -320,6 +472,7 @@ DASHBOARD_HTML = """
     .floor-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; padding: 16px 0; }
     .table-widget { background: #0f172a; border: 2px solid var(--green); border-radius: 12px; padding: 16px; text-align: center; position: relative; }
     .table-widget.occupied { border-color: var(--red); background: rgba(239, 68, 68, 0.12); }
+    .table-widget.needs-clearing { border-color: #f59e0b; background: rgba(245, 158, 11, 0.14); }
     .seats-row { display: flex; justify-content: center; gap: 8px; margin: 8px 0; }
     .seat-dot { width: 14px; height: 14px; border-radius: 50%; background: #334155; }
     .seat-dot.taken { background: var(--red); box-shadow: 0 0 6px var(--red); }
@@ -329,8 +482,9 @@ DASHBOARD_HTML = """
     .form-group { margin-bottom: 12px; }
     .form-group label { display: block; margin-bottom: 4px; color: var(--muted); font-size: 0.9rem; }
     .form-group input { width: 100%; padding: 8px; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: #fff; }
-    .an-kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 12px 0 18px; }
+    .an-kpis { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin: 12px 0 18px; }
     .an-kpis .card { background: #0f172a; }
+    .sim-box { background: rgba(34, 197, 94, 0.1); border: 1px solid var(--green); padding: 14px; border-radius: 8px; margin: 14px 0; }
     .hour-chart { display: flex; align-items: flex-end; gap: 3px; height: 120px; margin: 10px 0 4px; }
     .hour-chart .bar { flex: 1; background: var(--accent); border-radius: 3px 3px 0 0; min-height: 2px; }
     .hour-labels { display: flex; gap: 3px; font-size: 0.65rem; color: var(--muted); }
@@ -338,7 +492,6 @@ DASHBOARD_HTML = """
     .heat { display: grid; grid-template-columns: 38px repeat(24, 1fr); gap: 2px; margin-top: 10px; font-size: 0.7rem; color: var(--muted); }
     .heat .cell { height: 22px; border-radius: 3px; background: #0f172a; }
     #an-hint { margin: 12px 0; padding: 10px 12px; border-left: 4px solid var(--accent); background: #0f172a; border-radius: 4px; }
-    .table-widget.needs-clearing { border-color: #f59e0b; background: rgba(245, 158, 11, 0.14); }
     .btn.small { padding: 4px 10px; font-size: 0.8rem; margin-top: 8px; }
     .right-col { display: flex; flex-direction: column; gap: 20px; }
     #alerts { list-style: none; max-height: 240px; overflow-y: auto; margin-top: 10px; }
@@ -352,10 +505,10 @@ DASHBOARD_HTML = """
 </head>
 <body>
   <header>
-    <h2>🍽️ TablePulse — Live Restaurant Occupancy</h2>
+    <h2>🍽️ TablePulse — Live Restaurant Occupancy &amp; Turnover</h2>
     <div class="tabs">
       <button id="tab-live" class="active" onclick="showTab('live')">Live Floor</button>
-      <button id="tab-history" onclick="showTab('history')">History & Analytics</button>
+      <button id="tab-history" onclick="showTab('history')">Turnover &amp; Analytics</button>
       <button id="tab-settings" onclick="showTab('settings')">Settings</button>
       <button onclick="restartVideo()">↻ Restart Video</button>
     </div>
@@ -387,37 +540,50 @@ DASHBOARD_HTML = """
     </div>
   </div>
 
-  <!-- HISTORY TAB -->
+  <!-- HISTORY & TURNOVER TAB -->
   <div id="view-history" class="card hidden">
-    <h3>Busy Hours &amp; Staffing <span style="color:var(--muted);font-weight:400;font-size:0.8rem;">(last 30 days)</span></h3>
+    <h3>Table Turnover, Bussing Speed &amp; Revenue Impact <span style="color:var(--muted);font-weight:400;font-size:0.8rem;">(last 30 days)</span></h3>
     <div class="an-kpis" id="an-kpis"></div>
+    <div class="sim-box" id="an-sim"></div>
     <div id="an-hint"></div>
-    <div style="color:var(--muted);font-size:0.85rem;">Average occupied tables by hour of day</div>
+
+    <h3 style="margin-top:20px;">Table Turnover Ranking (Slowest First) &amp; Seating Efficiency</h3>
+    <table>
+      <thead><tr><th>Table</th><th>Turns</th><th>Avg Dining</th><th>Avg Clear Speed</th><th>Total Cycle</th><th>Avg Guests</th><th>Seat Fill %</th></tr></thead>
+      <tbody id="turnover-body"></tbody>
+    </table>
+
+    <div style="color:var(--muted);font-size:0.85rem;margin-top:20px;">Average occupied tables by hour of day</div>
     <div class="hour-chart" id="an-hours"></div>
     <div class="hour-labels" id="an-hour-labels"></div>
     <div style="color:var(--muted);font-size:0.85rem;margin-top:18px;">Weekday &times; hour heatmap (darker = busier)</div>
     <div class="heat" id="an-heat"></div>
     <h3 style="margin-top:26px;">Completed Table Visits</h3>
     <table>
-      <thead><tr><th>ID</th><th>Table</th><th>Guests</th><th>Duration (s)</th><th>Timestamp</th></tr></thead>
+      <thead><tr><th>ID</th><th>Table</th><th>Guests</th><th>Dining Duration</th><th>Clear Speed</th><th>Timestamp</th></tr></thead>
       <tbody id="history-body"></tbody>
     </table>
   </div>
 
   <!-- SETTINGS TAB -->
   <div id="view-settings" class="card hidden" style="max-width: 550px;">
-    <h3 style="margin-bottom: 14px;">Pipeline & CCTV Settings</h3>
+    <h3 style="margin-bottom: 14px;">Pipeline, Turnover Alerts &amp; Simulator Settings</h3>
     <div class="form-group"><label><input id="set-stab" type="checkbox" style="width:auto; margin-right:8px;"> Lock Polygons to Camera Motion (ORB Stabilizer)</label></div>
     <div class="form-group"><label>Video Path or RTSP/HTTP CCTV URL</label><input id="set-video" type="text"></div>
     <div class="form-group"><label>Seats Per Table</label><input id="set-seats" type="number"></div>
     <div class="form-group"><label>Occupy Timer (seconds)</label><input id="set-occ" type="number" step="0.5"></div>
     <div class="form-group"><label>Table Empty Timer before Guests Count as Left (seconds)</label><input id="set-free" type="number" step="0.5"></div>
     <div class="form-group"><label>Check-on-Table Alert After (seconds)</label><input id="set-check" type="number" step="10"></div>
+    <div class="form-group"><label>Alert When Dirty Table Uncleared After (seconds)</label><input id="set-clear-alert" type="number" step="10"></div>
+    <div class="form-group"><label>Alert When Free Table Vacant Too Long (seconds)</label><input id="set-vacant-alert" type="number" step="30"></div>
+    <div class="form-group"><label>Target Dining Duration for Simulator (minutes)</label><input id="set-target-min" type="number" step="5"></div>
+    <div class="form-group"><label>Average Customer Spend (PHP)</label><input id="set-spend" type="number" step="50"></div>
+    <div class="form-group"><label>Daily Operating Hours</label><input id="set-hours" type="number" step="1"></div>
     <div class="form-group"><label>Inference Rate (frames per second)</label><input id="set-infer" type="number" step="0.5"></div>
     <div class="form-group"><label>Time to Accept Higher Count (seconds)</label><input id="set-up" type="number" step="0.5"></div>
     <div class="form-group"><label>Time to Accept Lower Count (seconds)</label><input id="set-down" type="number" step="0.5"></div>
     <div class="form-group"><label>YOLO Confidence Threshold</label><input id="set-conf" type="number" step="0.05"></div>
-    <button class="btn" onclick="saveSettings()">Save & Apply Settings</button>
+    <button class="btn" onclick="saveSettings()">Save &amp; Apply Settings</button>
   </div>
 
   <script>
@@ -454,8 +620,8 @@ DASHBOARD_HTML = """
               ${seatsHtml}
               <div style="font-size:0.85rem;color:#cbd5e1;">
                 ${t.occupied ? `👥 ${t.guests} Guests<br>⏱️ ${fmtDur(t.duration_sec)}${t.check_due ? ' ⚠️ check in' : ''}`
-                  : t.state === 'needs_clearing' ? `🧹 Needs clearing (${fmtDur(t.dirty_sec)})<br><button class="btn small" data-cleared="${encodeURIComponent(tName)}">Mark cleared</button>`
-                  : 'Available'}
+                  : t.state === 'needs_clearing' ? `🧹 Needs clearing (${fmtDur(t.dirty_sec)})${t.clearing_overdue ? ' 🚨 OVERDUE' : ''}<br><button class="btn small" data-cleared="${encodeURIComponent(tName)}">Mark cleared</button>`
+                  : `Available (${fmtDur(t.vacant_sec || 0)})${t.vacant_overdue ? ' ⏳ Idle' : ''}`}
               </div>
             </div>`;
         });
@@ -467,7 +633,7 @@ DASHBOARD_HTML = """
       const data = await res.json();
       const tbody = document.getElementById('history-body');
       tbody.innerHTML = data.history.map(r =>
-        `<tr><td>#${r.id}</td><td>${r.table_name}</td><td>${r.guests}</td><td>${r.duration_sec}s</td><td>${r.timestamp}</td></tr>`
+        `<tr><td>#${r.id}</td><td>${r.table_name}</td><td>${r.guests}</td><td>${r.duration_sec}s</td><td>${r.clear_duration_sec}s</td><td>${r.timestamp}</td></tr>`
       ).join('');
     }
 
@@ -483,24 +649,53 @@ DASHBOARD_HTML = """
     async function loadAnalytics() {
       const a = await (await fetch('/api/analytics')).json();
       const s = a.summary;
+      const sim = a.turnover_simulator;
 
       const kpis = document.getElementById('an-kpis');
       kpis.replaceChildren();
-      [['Visits', s.visits], ['Avg Seated Time', `${Math.round(s.avg_duration_sec / 60)} min`],
-       ['Avg Party Size', s.avg_party_size], ['Peak Tables Used', `${s.peak_occupied} / ${s.total_tables}`]]
-        .forEach(([title, val]) => {
-          const c = el('div', 'card');
-          c.append(el('div', 'kpi-title', title), el('div', 'kpi-value', String(val)));
-          kpis.append(c);
-        });
+      [
+        ['Visits', s.visits],
+        ['Avg Dining Time', `${Math.round(s.avg_duration_sec / 60)} min (${s.avg_duration_sec}s)`],
+        ['Avg Clear Speed', `${s.avg_clear_sec}s`],
+        ['Seat Fill Efficiency', `${s.seat_efficiency_pct}%`],
+        ['Peak Tables Used', `${s.peak_occupied} / ${s.total_tables}`]
+      ].forEach(([title, val]) => {
+        const c = el('div', 'card');
+        c.append(el('div', 'kpi-title', title), el('div', 'kpi-value', String(val)));
+        kpis.append(c);
+      });
+
+      const simBox = document.getElementById('an-sim');
+      simBox.innerHTML = `
+        <strong> Table Turnover &amp; Revenue Impact Simulator (PHP)</strong><br>
+        <span style="font-size:0.9rem;color:#cbd5e1;">
+          With <strong>${sim.tables} tables</strong> over <strong>${sim.operating_hours} hrs/day</strong> (avg party: ${sim.avg_party_size}, avg spend: ₱${sim.avg_spend_php.toLocaleString()}/guest):<br>
+          • Reducing cycle time from <strong>${sim.current_cycle_min} min</strong> to <strong>${sim.target_cycle_min} min</strong> increases daily sessions from <strong>${sim.current_daily_sessions}</strong> to <strong>${sim.target_daily_sessions}</strong> (+${sim.extra_daily_sessions} sessions / +${sim.extra_daily_guests} guests/day).<br>
+          • Projected Revenue Gain: <strong>+₱${sim.extra_daily_revenue_php.toLocaleString()} / day</strong> (<strong>+₱${sim.extra_monthly_revenue_php.toLocaleString()} / month</strong>).
+        </span>
+      `;
+
+      const tbody = document.getElementById('turnover-body');
+      tbody.innerHTML = a.turnover_ranking.map(t =>
+        `<tr>
+          <td><strong>${t.table_name}</strong></td>
+          <td>${t.turns}</td>
+          <td>${t.avg_dining_sec}s</td>
+          <td>${t.avg_clear_sec}s</td>
+          <td><strong>${t.avg_cycle_sec}s</strong></td>
+          <td>${t.avg_guests}</td>
+          <td>${t.seat_efficiency_pct}%</td>
+        </tr>`
+      ).join('') || '<tr><td colspan="7">No completed table turns recorded yet.</td></tr>';
 
       const hint = document.getElementById('an-hint');
+      const opps = a.seating_opportunities.length ? ` | Seating tips: ${a.seating_opportunities.join(' ')}` : '';
       if (a.busiest.length) {
         const parts = a.busiest.map(b =>
           `${DAYS[b.weekday]} ${hourLabel(b.hour)} (avg ${b.avg_occupied} tables → ${b.servers_needed} server${b.servers_needed > 1 ? 's' : ''})`);
-        hint.textContent = `Busiest slots: ${parts.join('; ')}. Assumes ${a.tables_per_server} tables per server.`;
+        hint.textContent = `Busiest slots: ${parts.join('; ')}.${opps}`;
       } else {
-        hint.textContent = 'Not enough data yet. Occupancy is sampled every minute, so check back after the camera has run for a while.';
+        hint.textContent = `Occupancy is sampled every minute.${opps}`;
       }
 
       const maxH = Math.max(...a.by_hour, 0.01);
@@ -539,6 +734,11 @@ DASHBOARD_HTML = """
       document.getElementById('set-down').value = s.down_lock_seconds;
       document.getElementById('set-conf').value = s.confidence;
       document.getElementById('set-check').value = s.check_after_seconds;
+      document.getElementById('set-clear-alert').value = s.clear_alert_seconds || 180;
+      document.getElementById('set-vacant-alert').value = s.vacant_alert_seconds || 900;
+      document.getElementById('set-target-min').value = s.target_dining_minutes || 75;
+      document.getElementById('set-spend').value = s.avg_spend_php || 500;
+      document.getElementById('set-hours').value = s.operating_hours || 10;
       document.getElementById('set-infer').value = s.infer_fps;
       document.getElementById('set-stab').checked = s.stabilize_camera !== false;
     }
@@ -553,6 +753,11 @@ DASHBOARD_HTML = """
         down_lock_seconds: parseFloat(document.getElementById('set-down').value),
         confidence: parseFloat(document.getElementById('set-conf').value),
         check_after_seconds: parseFloat(document.getElementById('set-check').value),
+        clear_alert_seconds: parseFloat(document.getElementById('set-clear-alert').value),
+        vacant_alert_seconds: parseFloat(document.getElementById('set-vacant-alert').value),
+        target_dining_minutes: parseFloat(document.getElementById('set-target-min').value),
+        avg_spend_php: parseFloat(document.getElementById('set-spend').value),
+        operating_hours: parseFloat(document.getElementById('set-hours').value),
         infer_fps: parseFloat(document.getElementById('set-infer').value),
         stabilize_camera: document.getElementById('set-stab').checked
       };
@@ -587,9 +792,12 @@ DASHBOARD_HTML = """
     }
     const ALERT_TEXT = {
       SEATED: e => ['ok', `${e.table}: guests seated (${e.guests})`],
+      GUESTS_LEFT: e => ['clear', `${e.table} is now vacant (${e.guests} guests left after ${e.duration_sec}s)`],
       CHECK_ON_TABLE: e => ['check', `Check on ${e.table} (${Math.round(e.seated_sec / 60)} min seated)`],
       NEEDS_CLEARING: e => ['clear', `${e.table} needs clearing`],
-      CLEARED: e => ['ok', `${e.table} cleared`],
+      CLEARING_OVERDUE: e => ['clear', `🚨 ${e.table} unbussed for ${Math.round(e.dirty_sec / 60)} min!`],
+      CLEARED: e => ['ok', `${e.table} cleared & ready in ${e.clear_duration_sec || 0}s`],
+      VACANT_TOO_LONG: e => ['check', `⏳ ${e.table} has been vacant for ${Math.round(e.vacant_sec / 60)} min`],
     };
     function addAlert(e) {
       const fn = ALERT_TEXT[e.type];
@@ -602,8 +810,8 @@ DASHBOARD_HTML = """
       const list = document.getElementById('alerts');
       list.prepend(li);
       while (list.children.length > 50) list.lastChild.remove();
-      const fresh = Date.now() / 1000 - e.ts < 30;   // don't notify for replayed history
-      if (fresh && (e.type === 'CHECK_ON_TABLE' || e.type === 'NEEDS_CLEARING')) {
+      const fresh = Date.now() / 1000 - e.ts < 30;
+      if (fresh && ['CHECK_ON_TABLE', 'NEEDS_CLEARING', 'CLEARING_OVERDUE', 'VACANT_TOO_LONG'].includes(e.type)) {
         beep();
         if ('Notification' in window && Notification.permission === 'granted') new Notification('TablePulse', { body: text });
       }
@@ -623,5 +831,4 @@ def index():
     return DASHBOARD_HTML
 
 if __name__ == "__main__":
-    # Bind to localhost until authentication is added (this serves a live camera feed).
     uvicorn.run(app, host="0.0.0.0", port=8020)
