@@ -7,6 +7,7 @@ typedef JsonMap = Map<String, dynamic>;
 typedef JsonMapList = List<JsonMap>;
 typedef DoubleRow = List<double>;
 typedef HeatmapGrid = List<DoubleRow>;
+typedef StringList = List<String>;
 
 const String kTablePulseApiUrl = String.fromEnvironment(
   'KITE_API_URL',
@@ -20,7 +21,10 @@ class TableStat {
   final int guests;
   final int durationSec;
   final int dirtySec;
+  final int vacantSec;
   final bool checkDue;
+  final bool clearingOverdue;
+  final bool vacantOverdue;
   final List<int> takenSeats;
   final int totalSeats;
 
@@ -31,7 +35,10 @@ class TableStat {
     required this.guests,
     required this.durationSec,
     required this.dirtySec,
+    required this.vacantSec,
     required this.checkDue,
+    required this.clearingOverdue,
+    required this.vacantOverdue,
     required this.takenSeats,
     required this.totalSeats,
   });
@@ -46,7 +53,10 @@ class TableStat {
       guests: json['guests'] as int? ?? 0,
       durationSec: json['duration_sec'] as int? ?? 0,
       dirtySec: json['dirty_sec'] as int? ?? 0,
+      vacantSec: json['vacant_sec'] as int? ?? 0,
       checkDue: json['check_due'] as bool? ?? false,
+      clearingOverdue: json['clearing_overdue'] as bool? ?? false,
+      vacantOverdue: json['vacant_overdue'] as bool? ?? false,
       takenSeats: List<int>.from(json['taken_seats'] ?? []),
       totalSeats: json['total_seats'] as int? ?? 4,
     );
@@ -105,6 +115,10 @@ class StaffEvent {
   final String time;
   final int? guests;
   final int? seatedSec;
+  final int? dirtySec;
+  final int? vacantSec;
+  final double? durationSec;
+  final double? clearDurationSec;
 
   StaffEvent({
     required this.id,
@@ -114,6 +128,10 @@ class StaffEvent {
     required this.time,
     this.guests,
     this.seatedSec,
+    this.dirtySec,
+    this.vacantSec,
+    this.durationSec,
+    this.clearDurationSec,
   });
 
   factory StaffEvent.fromJson(JsonMap json) {
@@ -125,6 +143,10 @@ class StaffEvent {
       time: json['time'] as String? ?? '',
       guests: json['guests'] as int?,
       seatedSec: json['seated_sec'] as int?,
+      dirtySec: json['dirty_sec'] as int?,
+      vacantSec: json['vacant_sec'] as int?,
+      durationSec: (json['duration_sec'] as num?)?.toDouble(),
+      clearDurationSec: (json['clear_duration_sec'] as num?)?.toDouble(),
     );
   }
 }
@@ -133,6 +155,9 @@ class AnalyticsData {
   final int days;
   final int tablesPerServer;
   final JsonMap summary;
+  final JsonMapList turnoverRanking;
+  final StringList seatingOpportunities;
+  final JsonMap turnoverSimulator;
   final HeatmapGrid heatmap;
   final DoubleRow byHour;
   final JsonMapList busiest;
@@ -141,6 +166,9 @@ class AnalyticsData {
     required this.days,
     required this.tablesPerServer,
     required this.summary,
+    required this.turnoverRanking,
+    required this.seatingOpportunities,
+    required this.turnoverSimulator,
     required this.heatmap,
     required this.byHour,
     required this.busiest,
@@ -155,11 +183,18 @@ class AnalyticsData {
     final byHour = rawHours.map((v) => (v as num).toDouble()).toList();
     final rawBusiest = json['busiest'] as List<dynamic>? ?? [];
     final busiestList = rawBusiest.map((b) => JsonMap.from(b as Map)).toList();
+    final rawRanking = json['turnover_ranking'] as List<dynamic>? ?? [];
+    final rankingList = rawRanking.map((r) => JsonMap.from(r as Map)).toList();
+    final rawOpps = json['seating_opportunities'] as List<dynamic>? ?? [];
+    final oppsList = rawOpps.map((o) => o.toString()).toList();
 
     return AnalyticsData(
       days: json['days'] as int? ?? 30,
       tablesPerServer: json['tables_per_server'] as int? ?? 4,
       summary: JsonMap.from(json['summary'] as Map? ?? {}),
+      turnoverRanking: rankingList,
+      seatingOpportunities: oppsList,
+      turnoverSimulator: JsonMap.from(json['turnover_simulator'] as Map? ?? {}),
       heatmap: heat,
       byHour: byHour,
       busiest: busiestList,

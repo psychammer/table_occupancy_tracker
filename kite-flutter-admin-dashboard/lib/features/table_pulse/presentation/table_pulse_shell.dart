@@ -17,6 +17,13 @@ class _TablePulseShellState extends ConsumerState<TablePulseShell> {
   int _lastEventId = 0;
   Timer? _eventsTimer;
 
+  static const _urgentTypes = {
+    'CHECK_ON_TABLE',
+    'NEEDS_CLEARING',
+    'CLEARING_OVERDUE',
+    'VACANT_TOO_LONG',
+  };
+
   @override
   void initState() {
     super.initState();
@@ -35,9 +42,8 @@ class _TablePulseShellState extends ConsumerState<TablePulseShell> {
     setState(() {
       for (final e in newEvents) {
         _lastEventId = e.id > _lastEventId ? e.id : _lastEventId;
-        if (e.type == 'GUESTS_LEFT') continue;
         _alerts.insert(0, e);
-        if (nowSec - e.ts < 30 && (e.type == 'CHECK_ON_TABLE' || e.type == 'NEEDS_CLEARING')) {
+        if (nowSec - e.ts < 30 && _urgentTypes.contains(e.type)) {
           shouldAlertStaff = true;
         }
       }
@@ -56,7 +62,9 @@ class _TablePulseShellState extends ConsumerState<TablePulseShell> {
             shape: RoundedRectangleBorder(
               borderRadius: BorderRadius.circular(8),
               side: BorderSide(
-                color: latest.type == 'NEEDS_CLEARING' ? Colors.amber : Colors.redAccent,
+                color: latest.type == 'CLEARING_OVERDUE' || latest.type == 'NEEDS_CLEARING'
+                    ? Colors.redAccent
+                    : Colors.amber,
               ),
             ),
             content: Text(
@@ -74,13 +82,21 @@ class _TablePulseShellState extends ConsumerState<TablePulseShell> {
     switch (e.type) {
       case 'SEATED':
         return '${e.table}: guests seated (${e.guests ?? 1})';
+      case 'GUESTS_LEFT':
+        return '🏃 ${e.table} is now vacant (${e.guests ?? 1}p left after ${e.durationSec?.round() ?? 0}s)';
       case 'CHECK_ON_TABLE':
         final mins = ((e.seatedSec ?? 0) / 60).round();
         return '⚠️ Check on ${e.table} ($mins min seated)';
       case 'NEEDS_CLEARING':
         return '🧹 ${e.table} needs clearing';
+      case 'CLEARING_OVERDUE':
+        final mins = ((e.dirtySec ?? 0) / 60).round();
+        return '🚨 ${e.table} unbussed for $mins min!';
       case 'CLEARED':
-        return '✅ ${e.table} cleared';
+        return '✅ ${e.table} cleared & reset in ${e.clearDurationSec ?? 0}s';
+      case 'VACANT_TOO_LONG':
+        final mins = ((e.vacantSec ?? 0) / 60).round();
+        return '⏳ ${e.table} vacant for $mins min';
       default:
         return '${e.table}: ${e.type}';
     }
@@ -100,9 +116,7 @@ class _TablePulseShellState extends ConsumerState<TablePulseShell> {
       const _SettingsTab(),
     ];
 
-    final hasUrgentAlert = _alerts.any(
-      (a) => a.type == 'NEEDS_CLEARING' || a.type == 'CHECK_ON_TABLE',
-    );
+    final hasUrgentAlert = _alerts.any((a) => _urgentTypes.contains(a.type));
 
     return Scaffold(
       body: SafeArea(child: pages[_selectedIndex]),
@@ -123,8 +137,8 @@ class _TablePulseShellState extends ConsumerState<TablePulseShell> {
               label: 'Live Floor',
             ),
             const NavigationDestination(
-              icon: Icon(Icons.bar_chart_rounded),
-              label: 'Analytics',
+              icon: Icon(Icons.trending_up_rounded),
+              label: 'Turnover & ROI',
             ),
             const NavigationDestination(
               icon: Icon(Icons.tune_rounded),
@@ -181,7 +195,6 @@ class _LiveFloorTabState extends ConsumerState<_LiveFloorTab> {
 
     return Column(
       children: [
-        // Kite Top Header Bar
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
           decoration: const BoxDecoration(
@@ -234,7 +247,6 @@ class _LiveFloorTabState extends ConsumerState<_LiveFloorTab> {
             data: (stats) => ListView(
               padding: const EdgeInsets.all(16),
               children: [
-                // 4 Kite Shadcn KPI Cards
                 GridView.count(
                   crossAxisCount: MediaQuery.of(context).size.width > 700 ? 4 : 2,
                   crossAxisSpacing: 12,
@@ -273,7 +285,6 @@ class _LiveFloorTabState extends ConsumerState<_LiveFloorTab> {
                 ),
                 const SizedBox(height: 16),
 
-                // Collapsible CCTV Feed
                 if (_showCamera) ...[
                   Card(
                     clipBehavior: Clip.antiAlias,
@@ -307,7 +318,6 @@ class _LiveFloorTabState extends ConsumerState<_LiveFloorTab> {
                   const SizedBox(height: 16),
                 ],
 
-                // Interactive Floor Plan
                 const Text(
                   'Interactive Floor Plan',
                   style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
@@ -320,7 +330,7 @@ class _LiveFloorTabState extends ConsumerState<_LiveFloorTab> {
                     maxCrossAxisExtent: 230,
                     mainAxisSpacing: 12,
                     crossAxisSpacing: 12,
-                    childAspectRatio: 1.05,
+                    childAspectRatio: 1.0,
                   ),
                   itemCount: stats.tables.length,
                   itemBuilder: (context, idx) {
@@ -351,13 +361,12 @@ class _LiveFloorTabState extends ConsumerState<_LiveFloorTab> {
                                 label: t.occupied
                                     ? 'BUSY'
                                     : t.needsClearing
-                                        ? 'CLEAR'
-                                        : 'FREE',
-                                color: statusColor,
+                                        ? (t.clearingOverdue ? 'OVERDUE' : 'CLEAR')
+                                        : (t.vacantOverdue ? 'IDLE' : 'FREE'),
+                                color: t.clearingOverdue ? Colors.redAccent : statusColor,
                               ),
                             ],
                           ),
-                          // Seat Dots
                           Row(
                             mainAxisAlignment: MainAxisAlignment.center,
                             children: List.generate(t.totalSeats, (i) {
@@ -388,8 +397,8 @@ class _LiveFloorTabState extends ConsumerState<_LiveFloorTab> {
                               height: 30,
                               child: FilledButton(
                                 style: FilledButton.styleFrom(
-                                  backgroundColor: const Color(0xFFF59E0B),
-                                  foregroundColor: Colors.black,
+                                  backgroundColor: t.clearingOverdue ? Colors.redAccent : const Color(0xFFF59E0B),
+                                  foregroundColor: t.clearingOverdue ? Colors.white : Colors.black,
                                   padding: const EdgeInsets.symmetric(horizontal: 8),
                                 ),
                                 onPressed: () async {
@@ -404,7 +413,13 @@ class _LiveFloorTabState extends ConsumerState<_LiveFloorTab> {
                               ),
                             )
                           else
-                            const Text('Available', style: TextStyle(fontSize: 12, color: Color(0xFFA1A1AA))),
+                            Text(
+                              'Vacant (${_fmtDur(t.vacantSec)})${t.vacantOverdue ? ' ⏳' : ''}',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: t.vacantOverdue ? Colors.amber : const Color(0xFFA1A1AA),
+                              ),
+                            ),
                         ],
                       ),
                     );
@@ -412,7 +427,6 @@ class _LiveFloorTabState extends ConsumerState<_LiveFloorTab> {
                 ),
                 const SizedBox(height: 20),
 
-                // Staff Alerts Card
                 const Text(
                   'Real-Time Staff Alerts',
                   style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
@@ -423,7 +437,7 @@ class _LiveFloorTabState extends ConsumerState<_LiveFloorTab> {
                       ? const Padding(
                           padding: EdgeInsets.all(16),
                           child: Text(
-                            'No alerts yet. Seating, check-in, and table clearing alerts appear here.',
+                            'No alerts yet. Vacancy, check-in, and bussing speed alerts appear here.',
                             style: TextStyle(color: Color(0xFFA1A1AA), fontSize: 13),
                           ),
                         )
@@ -434,9 +448,9 @@ class _LiveFloorTabState extends ConsumerState<_LiveFloorTab> {
                           separatorBuilder: (_, __) => const Divider(height: 1),
                           itemBuilder: (context, i) {
                             final a = widget.alerts[i];
-                            final Color dot = a.type == 'NEEDS_CLEARING'
+                            final Color dot = (a.type == 'NEEDS_CLEARING' || a.type == 'CLEARING_OVERDUE' || a.type == 'GUESTS_LEFT')
                                 ? Colors.redAccent
-                                : a.type == 'CHECK_ON_TABLE'
+                                : (a.type == 'CHECK_ON_TABLE' || a.type == 'VACANT_TOO_LONG')
                                     ? Colors.amber
                                     : Colors.greenAccent;
                             return ListTile(
@@ -461,7 +475,7 @@ class _LiveFloorTabState extends ConsumerState<_LiveFloorTab> {
 }
 
 // ============================================================================
-// TAB 2: BUSY HOURS ANALYTICS & COMPLETED VISITS
+// TAB 2: TURNOVER LEADERBOARD, PHP REVENUE FORECAST & BUSY HOURS
 // ============================================================================
 class _AnalyticsBundle {
   final AnalyticsData analytics;
@@ -484,7 +498,12 @@ class _AnalyticsAndHistoryTab extends ConsumerWidget {
     final repo = ref.watch(tablePulseRepoProvider);
 
     return Scaffold(
-      appBar: AppBar(title: const Text('History & Busy Hours (30d)', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700))),
+      appBar: AppBar(
+        title: const Text(
+          'Turnover, Bussing Speed & ROI (30d)',
+          style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700),
+        ),
+      ),
       body: FutureBuilder<_AnalyticsBundle>(
         future: _loadBundle(repo),
         builder: (context, snap) {
@@ -495,11 +514,13 @@ class _AnalyticsAndHistoryTab extends ConsumerWidget {
           final an = snap.data!.analytics;
           final history = snap.data!.history;
           final s = an.summary;
+          final sim = an.turnoverSimulator;
           final maxHourVal = an.byHour.fold<double>(0.01, (p, c) => c > p ? c : p);
 
           return ListView(
             padding: const EdgeInsets.all(16),
             children: [
+              // 4 Turnover KPI Cards
               GridView.count(
                 crossAxisCount: 2,
                 crossAxisSpacing: 12,
@@ -508,45 +529,141 @@ class _AnalyticsAndHistoryTab extends ConsumerWidget {
                 shrinkWrap: true,
                 physics: const NeverScrollableScrollPhysics(),
                 children: [
-                  _KiteKpiCard(title: 'Total Visits', value: '${s['visits'] ?? 0}', badge: '30d', badgeColor: Colors.lightBlueAccent),
                   _KiteKpiCard(
-                    title: 'Avg Seated Time',
+                    title: 'Total Visits',
+                    value: '${s['visits'] ?? 0}',
+                    badge: '30d',
+                    badgeColor: Colors.lightBlueAccent,
+                  ),
+                  _KiteKpiCard(
+                    title: 'Avg Dining Time',
                     value: '${((s['avg_duration_sec'] ?? 0) / 60).round()}m',
-                    badge: 'Dwell',
+                    badge: '${s['avg_duration_sec'] ?? 0}s',
                     badgeColor: Colors.amber,
                   ),
-                  _KiteKpiCard(title: 'Avg Party Size', value: '${s['avg_party_size'] ?? 0}', badge: 'Guests', badgeColor: Colors.greenAccent),
                   _KiteKpiCard(
-                    title: 'Peak Tables',
-                    value: '${s['peak_occupied'] ?? 0}/${s['total_tables'] ?? 0}',
-                    badge: 'Peak',
-                    badgeColor: Colors.redAccent,
+                    title: 'Avg Clear Speed',
+                    value: '${s['avg_clear_sec'] ?? 0}s',
+                    badge: 'Bussing',
+                    badgeColor: Colors.greenAccent,
+                  ),
+                  _KiteKpiCard(
+                    title: 'Seat Fill Efficiency',
+                    value: '${s['seat_efficiency_pct'] ?? 0}%',
+                    badge: 'Avg ${s['avg_party_size'] ?? 0}p',
+                    badgeColor: Colors.purpleAccent,
                   ),
                 ],
               ),
               const SizedBox(height: 16),
-              Card(
-                child: Padding(
+
+              // Green Projected Revenue Impact Box (PHP)
+              if (sim.isNotEmpty)
+                Container(
                   padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF22C55E).withOpacity(0.10),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: const Color(0xFF22C55E)),
+                  ),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Text('Staffing Recommendation', style: TextStyle(fontWeight: FontWeight.w600)),
+                      const Text(
+                        '💰 Projected Turnover & Revenue Impact (PHP)',
+                        style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: Color(0xFF4ADE80)),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        'With ${sim['tables']} tables over ${sim['operating_hours']} hrs/day (avg party: ${sim['avg_party_size']}, avg spend: ₱${sim['avg_spend_php']}/guest):',
+                        style: const TextStyle(fontSize: 12.5, color: Color(0xFFE4E4E7)),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        '• Reducing cycle time from ${sim['current_cycle_min']} min to ${sim['target_cycle_min']} min increases daily sessions from ${sim['current_daily_sessions']} to ${sim['target_daily_sessions']} (+${sim['extra_daily_sessions']} sessions / +${sim['extra_daily_guests']} guests/day).',
+                        style: const TextStyle(fontSize: 12.5, color: Color(0xFFE4E4E7)),
+                      ),
                       const SizedBox(height: 6),
                       Text(
-                        an.busiest.isNotEmpty
-                            ? an.busiest
-                                .map((b) =>
-                                    '• ${_days[b['weekday'] as int]} ${(b['hour'] as int).toString().padLeft(2, '0')}:00 → ${b['servers_needed']} server(s) (avg ${b['avg_occupied']} tables)')
-                                .join('\n')
-                            : 'Occupancy is sampled every 60s. Keep the camera running to populate staffing hints.',
-                        style: const TextStyle(color: Color(0xFFA1A1AA), fontSize: 13),
+                        'Projected Gain: +₱${sim['extra_daily_revenue_php']} / day (+₱${sim['extra_monthly_revenue_php']} / month)',
+                        style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 13.5, color: Colors.white),
                       ),
                     ],
                   ),
                 ),
+              const SizedBox(height: 16),
+
+              // Seating Efficiency & Staffing Tips
+              if (an.seatingOpportunities.isNotEmpty || an.busiest.isNotEmpty)
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(14),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('Operational & Seating Insights', style: TextStyle(fontWeight: FontWeight.w600)),
+                        const SizedBox(height: 6),
+                        if (an.busiest.isNotEmpty)
+                          Text(
+                            an.busiest
+                                .map((b) =>
+                                    '• Peak: ${_days[b['weekday'] as int]} ${(b['hour'] as int).toString().padLeft(2, '0')}:00 → ${b['servers_needed']} server(s) needed (avg ${b['avg_occupied']} tables)')
+                                .join('\n'),
+                            style: const TextStyle(color: Color(0xFFA1A1AA), fontSize: 12.5),
+                          ),
+                        if (an.seatingOpportunities.isNotEmpty) ...[
+                          const SizedBox(height: 6),
+                          Text(
+                            an.seatingOpportunities.map((o) => '• 💡 $o').join('\n'),
+                            style: const TextStyle(color: Color(0xFF38BDF8), fontSize: 12.5),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+              const SizedBox(height: 16),
+
+              // Slowest Table Turnover Ranking
+              const Text(
+                'Table Turnover Ranking (Slowest First)',
+                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 8),
+              Card(
+                child: an.turnoverRanking.isEmpty
+                    ? const Padding(
+                        padding: EdgeInsets.all(16),
+                        child: Text('No completed table turns yet.', style: TextStyle(color: Color(0xFFA1A1AA))),
+                      )
+                    : ListView.separated(
+                        shrinkWrap: true,
+                        physics: const NeverScrollableScrollPhysics(),
+                        itemCount: an.turnoverRanking.length,
+                        separatorBuilder: (_, __) => const Divider(height: 1),
+                        itemBuilder: (context, i) {
+                          final t = an.turnoverRanking[i];
+                          return ListTile(
+                            dense: true,
+                            title: Text(
+                              '${t['table_name']} • ${t['turns']} turns (Avg ${t['avg_guests']}p)',
+                              style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
+                            ),
+                            subtitle: Text(
+                              'Dining: ${t['avg_dining_sec']}s | Clear: ${t['avg_clear_sec']}s | Fill: ${t['seat_efficiency_pct']}%',
+                              style: const TextStyle(fontSize: 11.5, color: Color(0xFFA1A1AA)),
+                            ),
+                            trailing: _StatusPill(
+                              label: 'Cycle: ${t['avg_cycle_sec']}s',
+                              color: i == 0 ? Colors.redAccent : const Color(0xFF38BDF8),
+                            ),
+                          );
+                        },
+                      ),
               ),
               const SizedBox(height: 16),
+
+              // Hourly Bar Chart
               Card(
                 child: Padding(
                   padding: const EdgeInsets.all(14),
@@ -596,6 +713,7 @@ class _AnalyticsAndHistoryTab extends ConsumerWidget {
                 ),
               ),
               const SizedBox(height: 16),
+
               const Text('Completed Table Visits', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
               const SizedBox(height: 8),
               Card(
@@ -614,7 +732,10 @@ class _AnalyticsAndHistoryTab extends ConsumerWidget {
                           return ListTile(
                             dense: true,
                             title: Text('#${r['id']} • ${r['table_name']} (${r['guests']} guests)'),
-                            subtitle: Text('${r['timestamp']}', style: const TextStyle(fontSize: 11, color: Color(0xFFA1A1AA))),
+                            subtitle: Text(
+                              '${r['timestamp']} • Cleared in ${r['clear_duration_sec'] ?? 0}s',
+                              style: const TextStyle(fontSize: 11, color: Color(0xFFA1A1AA)),
+                            ),
                             trailing: _StatusPill(label: '${r['duration_sec']}s', color: const Color(0xFF38BDF8)),
                           );
                         },
@@ -629,7 +750,7 @@ class _AnalyticsAndHistoryTab extends ConsumerWidget {
 }
 
 // ============================================================================
-// TAB 3: PIPELINE & CCTV SETTINGS
+// TAB 3: PIPELINE, TURNOVER ALERTS & SIMULATOR SETTINGS
 // ============================================================================
 class _SettingsTab extends ConsumerStatefulWidget {
   const _SettingsTab();
@@ -644,6 +765,11 @@ class _SettingsTabState extends ConsumerState<_SettingsTab> {
   final _occCtrl = TextEditingController();
   final _freeCtrl = TextEditingController();
   final _checkCtrl = TextEditingController();
+  final _clearAlertCtrl = TextEditingController();
+  final _vacantAlertCtrl = TextEditingController();
+  final _targetMinCtrl = TextEditingController();
+  final _spendCtrl = TextEditingController();
+  final _hoursCtrl = TextEditingController();
   final _inferCtrl = TextEditingController();
   final _upCtrl = TextEditingController();
   final _downCtrl = TextEditingController();
@@ -666,6 +792,11 @@ class _SettingsTabState extends ConsumerState<_SettingsTab> {
       _occCtrl.text = '${s['occupy_seconds'] ?? 3.0}';
       _freeCtrl.text = '${s['free_seconds'] ?? 20.0}';
       _checkCtrl.text = '${s['check_after_seconds'] ?? 300.0}';
+      _clearAlertCtrl.text = '${s['clear_alert_seconds'] ?? 180.0}';
+      _vacantAlertCtrl.text = '${s['vacant_alert_seconds'] ?? 900.0}';
+      _targetMinCtrl.text = '${s['target_dining_minutes'] ?? 75.0}';
+      _spendCtrl.text = '${s['avg_spend_php'] ?? 500.0}';
+      _hoursCtrl.text = '${s['operating_hours'] ?? 10.0}';
       _inferCtrl.text = '${s['infer_fps'] ?? 4.0}';
       _upCtrl.text = '${s['up_lock_seconds'] ?? 2.0}';
       _downCtrl.text = '${s['down_lock_seconds'] ?? 10.0}';
@@ -682,6 +813,11 @@ class _SettingsTabState extends ConsumerState<_SettingsTab> {
       'occupy_seconds': double.tryParse(_occCtrl.text) ?? 3.0,
       'free_seconds': double.tryParse(_freeCtrl.text) ?? 20.0,
       'check_after_seconds': double.tryParse(_checkCtrl.text) ?? 300.0,
+      'clear_alert_seconds': double.tryParse(_clearAlertCtrl.text) ?? 180.0,
+      'vacant_alert_seconds': double.tryParse(_vacantAlertCtrl.text) ?? 900.0,
+      'target_dining_minutes': double.tryParse(_targetMinCtrl.text) ?? 75.0,
+      'avg_spend_php': double.tryParse(_spendCtrl.text) ?? 500.0,
+      'operating_hours': double.tryParse(_hoursCtrl.text) ?? 10.0,
       'infer_fps': double.tryParse(_inferCtrl.text) ?? 4.0,
       'up_lock_seconds': double.tryParse(_upCtrl.text) ?? 2.0,
       'down_lock_seconds': double.tryParse(_downCtrl.text) ?? 10.0,
@@ -700,7 +836,9 @@ class _SettingsTabState extends ConsumerState<_SettingsTab> {
   Widget build(BuildContext context) {
     if (!_loaded) return const Center(child: CircularProgressIndicator());
     return Scaffold(
-      appBar: AppBar(title: const Text('Pipeline & CCTV Settings', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700))),
+      appBar: AppBar(
+        title: const Text('Pipeline & Turnover Settings', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700)),
+      ),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
@@ -712,7 +850,10 @@ class _SettingsTabState extends ConsumerState<_SettingsTab> {
                   SwitchListTile(
                     contentPadding: EdgeInsets.zero,
                     title: const Text('ORB Camera Stabilizer', style: TextStyle(fontWeight: FontWeight.w600)),
-                    subtitle: const Text('Warps table polygons if camera shifts slightly', style: TextStyle(fontSize: 12, color: Color(0xFFA1A1AA))),
+                    subtitle: const Text(
+                      'Warps table polygons if camera shifts slightly',
+                      style: TextStyle(fontSize: 12, color: Color(0xFFA1A1AA)),
+                    ),
                     value: _stabilizeCamera,
                     onChanged: (v) => setState(() => _stabilizeCamera = v),
                   ),
@@ -720,8 +861,13 @@ class _SettingsTabState extends ConsumerState<_SettingsTab> {
                   _input('Video Path or RTSP URL', _videoCtrl, isNumber: false),
                   _input('Seats Per Table (1–20)', _seatsCtrl),
                   _input('Occupy Timer (seconds)', _occCtrl),
-                  _input('Free / Empty Timer (seconds)', _freeCtrl),
+                  _input('Free / Empty Timer before Guests Left (seconds)', _freeCtrl),
                   _input('Check-on-Table Alert After (seconds)', _checkCtrl),
+                  _input('Alert When Dirty Table Uncleared After (seconds)', _clearAlertCtrl),
+                  _input('Alert When Free Table Vacant Too Long (seconds)', _vacantAlertCtrl),
+                  _input('Target Dining Duration for ROI Forecast (minutes)', _targetMinCtrl),
+                  _input('Average Customer Spend (PHP)', _spendCtrl),
+                  _input('Daily Operating Hours', _hoursCtrl),
                   _input('Inference Rate (FPS, 0.5–30)', _inferCtrl),
                   _input('Up Lock Hysteresis (seconds)', _upCtrl),
                   _input('Down Lock Hysteresis (seconds)', _downCtrl),
@@ -761,9 +907,6 @@ class _SettingsTabState extends ConsumerState<_SettingsTab> {
   }
 }
 
-// ============================================================================
-// KITE SHADCN-STYLE REUSABLE UI COMPONENTS
-// ============================================================================
 class _KiteKpiCard extends StatelessWidget {
   final String title;
   final String value;
