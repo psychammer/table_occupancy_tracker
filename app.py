@@ -63,11 +63,19 @@ def init_db():
                 ts TEXT NOT NULL
             )""")
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS idle_times (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_name TEXT NOT NULL,
+                vacant_duration_sec REAL NOT NULL,
+                ts TEXT NOT NULL
+            )""")
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts TEXT NOT NULL, occupied INTEGER, needs_clearing INTEGER,
                 guests INTEGER, total_tables INTEGER
             )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_idle_ts ON idle_times(ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_ts ON snapshots(ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_clearings_ts ON clearings(ts)")
         cols = {r[1] for r in conn.execute("PRAGMA table_info(visits)")}
@@ -105,6 +113,12 @@ def push_event(e: dict):
         event_seq += 1
         e["id"] = event_seq
         events_buf.append(e)
+    if e.get("type") == "SEATED" and e.get("vacant_duration_sec", 0) > 0:
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO idle_times (table_name, vacant_duration_sec, ts) VALUES (?, ?, ?)",
+                (e["table"], e["vacant_duration_sec"], datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            )
 
 
 # ---------- background video worker ----------
@@ -254,6 +268,19 @@ def analytics(days: int = Query(30, ge=1, le=365), tables_per_server: int = Quer
             GROUP BY table_name
         """, (max(1, seats_per_table // 2), since)).fetchall()
 
+        active_days = conn.execute(
+            f"SELECT COUNT(DISTINCT DATE({vts})) FROM visits WHERE {vts} >= ?", (since,)
+        ).fetchone()[0] or 1
+
+        idle_rows = conn.execute(
+            "SELECT table_name, AVG(vacant_duration_sec) FROM idle_times WHERE ts >= ? GROUP BY table_name",
+            (since,),
+        ).fetchall()
+        idle_by_table = {r[0]: round(r[1] or 0.0, 1) for r in idle_rows}
+        overall_avg_idle_sec = round(
+            conn.execute("SELECT AVG(vacant_duration_sec) FROM idle_times WHERE ts >= ?", (since,)).fetchone()[0] or 0.0, 1
+        )
+
     heat = [[0.0] * 24 for _ in range(7)]
     guests = [[0.0] * 24 for _ in range(7)]
     visit_counts = [[0] * 24 for _ in range(7)]
@@ -283,6 +310,9 @@ def analytics(days: int = Query(30, ge=1, le=365), tables_per_server: int = Quer
         avg_g = round(avg_g or 0.0, 2)
         seat_eff_pct = round((avg_g / max(1, seats_per_table)) * 100.0, 1)
         under_pct = round(((under_visits or 0) / max(1, turns)) * 100.0, 1)
+        turns_per_day = round(turns / active_days, 2)
+        turns_per_hour = round(turns_per_day / max(1.0, operating_hours), 2)
+        avg_idle_sec = idle_by_table.get(t_name, 0.0)
 
         item = {
             "table_name": t_name,
@@ -293,6 +323,9 @@ def analytics(days: int = Query(30, ge=1, le=365), tables_per_server: int = Quer
             "avg_guests": avg_g,
             "seat_efficiency_pct": seat_eff_pct,
             "small_party_pct": under_pct,
+            "turns_per_day": turns_per_day,
+            "turns_per_hour": turns_per_hour,
+            "avg_idle_sec": avg_idle_sec,
         }
         table_turnover.append(item)
 
@@ -347,6 +380,9 @@ def analytics(days: int = Query(30, ge=1, le=365), tables_per_server: int = Quer
             "peak_occupied": s_tot[0] or 0,
             "total_tables": num_tables,
             "snapshots": s_tot[2] or 0,
+            "avg_idle_sec": overall_avg_idle_sec,
+            "turnover_rate_per_day": round((v_tot[0] or 0) / max(1, num_tables) / active_days, 2),
+            "turnover_rate_per_hour": round(((v_tot[0] or 0) / max(1, num_tables) / active_days) / max(1.0, operating_hours), 2),
         },
         "turnover_ranking": table_turnover,
         "slowest_tables": slowest_tables,
@@ -549,7 +585,18 @@ DASHBOARD_HTML = """
 
     <h3 style="margin-top:20px;">Table Turnover Ranking (Slowest First) &amp; Seating Efficiency</h3>
     <table>
-      <thead><tr><th>Table</th><th>Turns</th><th>Avg Dining</th><th>Avg Clear Speed</th><th>Total Cycle</th><th>Avg Guests</th><th>Seat Fill %</th></tr></thead>
+        <thead>
+            <tr>
+                <th>Table</th>
+                <th>Turns (Rate)</th>
+                <th>Avg Dining</th>
+                <th>Avg Clear</th>
+                <th>Avg Idle</th>
+                <th>Total Cycle</th>
+                <th>Avg Guests</th>
+                <th>Seat Fill %</th>
+            </tr>
+        </thead>
       <tbody id="turnover-body"></tbody>
     </table>
 
@@ -679,14 +726,15 @@ DASHBOARD_HTML = """
       tbody.innerHTML = a.turnover_ranking.map(t =>
         `<tr>
           <td><strong>${t.table_name}</strong></td>
-          <td>${t.turns}</td>
+          <td>${t.turns} (${t.turns_per_day}/day)</td>
           <td>${t.avg_dining_sec}s</td>
           <td>${t.avg_clear_sec}s</td>
+          <td>${t.avg_idle_sec}s</td>
           <td><strong>${t.avg_cycle_sec}s</strong></td>
           <td>${t.avg_guests}</td>
           <td>${t.seat_efficiency_pct}%</td>
         </tr>`
-      ).join('') || '<tr><td colspan="7">No completed table turns recorded yet.</td></tr>';
+      ).join('') || '<tr><td colspan="8">No completed table turns recorded yet.</td></tr>';
 
       const hint = document.getElementById('an-hint');
       const opps = a.seating_opportunities.length ? ` | Seating tips: ${a.seating_opportunities.join(' ')}` : '';

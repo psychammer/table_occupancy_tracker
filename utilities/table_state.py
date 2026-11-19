@@ -170,6 +170,7 @@ class TableState:
 
     # ---------- internals ----------
     def _seat(self, raw, now, events):
+        vacant_dur = round(now - self._free_since, 1) if self._free_since is not None else 0.0
         self._reset_visit()
         self.state = State.OCCUPIED
         self._free_since = None
@@ -179,8 +180,9 @@ class TableState:
         self._samples.append((now, raw))
         self.guests = max(1, raw)
         self.peak = self.guests
-        events.append(self._event("SEATED", guests=self.guests))
+        events.append(self._event("SEATED", guests=self.guests, vacant_duration_sec=vacant_dur))
 
+        
     def _update_occupied(self, raw, now, events):
         c = self.cfg
         if raw > 0:
