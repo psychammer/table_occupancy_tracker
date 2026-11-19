@@ -553,6 +553,18 @@ class _AnalyticsAndHistoryTab extends ConsumerWidget {
                     badge: 'Avg ${s['avg_party_size'] ?? 0}p',
                     badgeColor: Colors.purpleAccent,
                   ),
+                  _KiteKpiCard(
+                    title: 'Turnover Rate',
+                    value: '${s['turnover_rate_per_day'] ?? 0}/day',
+                    badge: '${s['turnover_rate_per_hour'] ?? 0}/hr',
+                    badgeColor: const Color(0xFF38BDF8),
+                  ),
+                  _KiteKpiCard(
+                    title: 'Avg Idle Time',
+                    value: '${s['avg_idle_sec'] ?? 0}s',
+                    badge: 'Vacant',
+                    badgeColor: Colors.orangeAccent,
+                  ),
                 ],
               ),
               const SizedBox(height: 16),
@@ -646,11 +658,11 @@ class _AnalyticsAndHistoryTab extends ConsumerWidget {
                           return ListTile(
                             dense: true,
                             title: Text(
-                              '${t['table_name']} • ${t['turns']} turns (Avg ${t['avg_guests']}p)',
+                              '${t['table_name']} • ${t['turns']} turns (${t['turns_per_day'] ?? 0}/day)',
                               style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
                             ),
                             subtitle: Text(
-                              'Dining: ${t['avg_dining_sec']}s | Clear: ${t['avg_clear_sec']}s | Fill: ${t['seat_efficiency_pct']}%',
+                              'Dining: ${t['avg_dining_sec']}s | Clear: ${t['avg_clear_sec']}s | Idle: ${t['avg_idle_sec'] ?? 0}s | Fill: ${t['seat_efficiency_pct']}%',
                               style: const TextStyle(fontSize: 11.5, color: Color(0xFFA1A1AA)),
                             ),
                             trailing: _StatusPill(
